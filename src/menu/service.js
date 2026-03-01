@@ -1,4 +1,21 @@
 import { pool } from "../dbClient.js";
+import { translate } from "@vitalets/google-translate-api";
+
+// Helper to generate translations automatically
+async function generateTranslations(text, targetLang = "hi") {
+  if (!text) return {};
+  try {
+    const res = await translate(text, { to: targetLang });
+    return {
+      en: text,
+      [targetLang]: res.text,
+    };
+  } catch (error) {
+    console.error(`[Translation] Failed to translate: "${text}"`, error);
+    return { en: text }; // Fallback to English if translation fails
+  }
+}
+
 
 export async function getRestaurantBySlug(slug) {
   // Public menu needs basic restaurant profile details as well
@@ -26,7 +43,7 @@ export async function getRestaurantBySlug(slug) {
 
 export async function getMenuForRestaurant(restaurantId, dietaryFilter = null) {
   const categoriesResult = await pool.query(
-    `SELECT id, name, sort_order AS "sortOrder"
+    `SELECT id, name, name_translations AS "nameTranslations", sort_order AS "sortOrder"
      FROM menu_categories
      WHERE restaurant_id = $1 AND is_active = true
      ORDER BY sort_order NULLS LAST, name ASC`,
@@ -38,7 +55,9 @@ export async function getMenuForRestaurant(restaurantId, dietaryFilter = null) {
     SELECT id,
             category_id AS "categoryId",
             name,
+            name_translations AS "nameTranslations",
             description,
+            description_translations AS "descriptionTranslations",
             price,
             image_url AS "imageUrl",
             is_available AS "isAvailable",
@@ -83,12 +102,18 @@ export async function setItemAvailability(restaurantId, itemId, isAvailable) {
 }
 
 export async function createCategory(restaurantId, data) {
-  const { name, sortOrder } = data;
+  const { name, sortOrder, nameTranslations } = data;
+  
+  // Auto-translate if no translations provided
+  const finalTranslations = nameTranslations && Object.keys(nameTranslations).length > 0 
+    ? nameTranslations 
+    : await generateTranslations(name);
+
   const result = await pool.query(
-    `INSERT INTO menu_categories (restaurant_id, name, sort_order, is_active)
-     VALUES ($1, $2, $3, true)
-     RETURNING id, name, sort_order AS "sortOrder", is_active AS "isActive"`,
-    [restaurantId, name, sortOrder ?? null],
+    `INSERT INTO menu_categories (restaurant_id, name, name_translations, sort_order, is_active)
+     VALUES ($1, $2, $3, $4, true)
+     RETURNING id, name, name_translations AS "nameTranslations", sort_order AS "sortOrder", is_active AS "isActive"`,
+    [restaurantId, name, finalTranslations, sortOrder ?? null],
   );
   return result.rows[0];
 }
@@ -101,7 +126,20 @@ export async function updateCategory(restaurantId, categoryId, data) {
   if (data.name !== undefined) {
     fields.push(`name = $${idx++}`);
     values.push(data.name);
+
+    if (data.nameTranslations === undefined) {
+      // Name changed but translations not explicitly provided, auto-generate them
+      const newTranslations = await generateTranslations(data.name);
+      fields.push(`name_translations = $${idx++}`);
+      values.push(newTranslations);
+    }
   }
+  
+  if (data.nameTranslations !== undefined) {
+    fields.push(`name_translations = $${idx++}`);
+    values.push(data.nameTranslations);
+  }
+  
   if (data.sortOrder !== undefined) {
     fields.push(`sort_order = $${idx++}`);
     values.push(data.sortOrder);
@@ -120,7 +158,7 @@ export async function updateCategory(restaurantId, categoryId, data) {
     `UPDATE menu_categories
      SET ${fields.join(", ")}, updated_at = now()
      WHERE restaurant_id = $${idx} AND id = $${idx + 1}
-     RETURNING id, name, sort_order AS "sortOrder", is_active AS "isActive"`,
+     RETURNING id, name, name_translations AS "nameTranslations", sort_order AS "sortOrder", is_active AS "isActive"`,
     values,
   );
   return result.rows[0] || null;
@@ -171,7 +209,9 @@ export async function createMenuItem(restaurantId, data) {
   const {
     categoryId,
     name,
+    nameTranslations,
     description,
+    descriptionTranslations,
     price,
     imageUrl,
     isAvailable = true,
@@ -179,19 +219,34 @@ export async function createMenuItem(restaurantId, data) {
     sortOrder,
   } = data;
 
+  const finalNameTranslations = nameTranslations && Object.keys(nameTranslations).length > 0
+    ? nameTranslations
+    : await generateTranslations(name);
+    
+  let finalDescTranslations = descriptionTranslations && Object.keys(descriptionTranslations).length > 0
+    ? descriptionTranslations
+    : {};
+    
+  if (!descriptionTranslations && description) {
+    finalDescTranslations = await generateTranslations(description);
+  }
+
   const result = await pool.query(
     `INSERT INTO menu_items
-      (restaurant_id, category_id, name, description, price, image_url, is_available, dietary_tags, sort_order)
+      (restaurant_id, category_id, name, name_translations, description, description_translations, price, image_url, is_available, dietary_tags, sort_order)
      VALUES
-      ($1,            $2,          $3,   $4,         $5,    $6,       $7,           $8,           $9)
-     RETURNING id, category_id AS "categoryId", name, description, price,
+      ($1,            $2,          $3,   $4,                $5,          $6,                       $7,    $8,        $9,           $10,          $11)
+     RETURNING id, category_id AS "categoryId", name, name_translations AS "nameTranslations", 
+               description, description_translations AS "descriptionTranslations", price,
                image_url AS "imageUrl", is_available AS "isAvailable",
                dietary_tags AS "dietaryTags", sort_order AS "sortOrder"`,
     [
       restaurantId,
       categoryId,
       name,
+      finalNameTranslations,
       description || null,
+      finalDescTranslations,
       price,
       imageUrl || null,
       isAvailable,
@@ -211,7 +266,9 @@ export async function updateMenuItem(restaurantId, itemId, data) {
   const map = {
     categoryId: "category_id",
     name: "name",
+    nameTranslations: "name_translations",
     description: "description",
+    descriptionTranslations: "description_translations",
     price: "price",
     imageUrl: "image_url",
     isAvailable: "is_available",
@@ -226,6 +283,21 @@ export async function updateMenuItem(restaurantId, itemId, data) {
       idx += 1;
     }
   }
+  
+  // Auto-translate if name/description changed but translations weren't explicitly provided
+  if (data.name !== undefined && data.nameTranslations === undefined) {
+    const newNameTranslations = await generateTranslations(data.name);
+    fields.push(`name_translations = $${idx}`);
+    values.push(newNameTranslations);
+    idx += 1;
+  }
+  
+  if (data.description !== undefined && data.descriptionTranslations === undefined) {
+    const newDescTranslations = await generateTranslations(data.description);
+    fields.push(`description_translations = $${idx}`);
+    values.push(newDescTranslations);
+    idx += 1;
+  }
 
   if (!fields.length) return null;
 
@@ -236,7 +308,8 @@ export async function updateMenuItem(restaurantId, itemId, data) {
     `UPDATE menu_items
      SET ${fields.join(", ")}, updated_at = now()
      WHERE restaurant_id = $${idx} AND id = $${idx + 1}
-     RETURNING id, category_id AS "categoryId", name, description, price,
+     RETURNING id, category_id AS "categoryId", name, name_translations AS "nameTranslations",
+               description, description_translations AS "descriptionTranslations", price,
                image_url AS "imageUrl", is_available AS "isAvailable",
                dietary_tags AS "dietaryTags", sort_order AS "sortOrder"`,
     values,

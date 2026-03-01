@@ -34,7 +34,7 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
   // Batch fetch base menu items
   const menuItemIds = Array.from(new Set(items.map((i) => i.menuItemId)));
   const menuItemRows = await db
-    .select({ id: menuItems.id, name: menuItems.name, price: menuItems.price })
+    .select({ id: menuItems.id, name: menuItems.name, nameTranslations: menuItems.nameTranslations, price: menuItems.price })
     .from(menuItems)
     .where(and(eq(menuItems.restaurantId, restaurantId), inArray(menuItems.id, menuItemIds)));
 
@@ -48,6 +48,7 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
           id: menuItemVariants.id,
           menuItemId: menuItemVariants.menuItemId,
           variantName: menuItemVariants.variantName,
+          variantNameTranslations: menuItemVariants.variantNameTranslations,
           price: menuItemVariants.price,
         })
         .from(menuItemVariants)
@@ -66,6 +67,7 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
         .select({
           id: modifiers.id,
           name: modifiers.name,
+          nameTranslations: modifiers.nameTranslations,
           price: modifiers.price,
           groupId: modifiers.modifierGroupId,
           groupName: modifierGroups.name,
@@ -93,6 +95,7 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
         variantData = {
           id: variant.id,
           name: variant.variantName,
+          nameTranslations: variant.variantNameTranslations,
           price: parseFloat(variant.price),
         };
         basePrice = variantData.price;
@@ -111,6 +114,7 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
         modifiersData.push({
           id: mod.id,
           name: mod.name,
+          nameTranslations: mod.nameTranslations,
           price: modPrice,
           groupId: mod.groupId,
           groupName: mod.groupName,
@@ -125,6 +129,7 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
     processedItems.push({
       menuItemId: item.menuItemId,
       itemName: menuItem.name,
+      itemNameTranslations: menuItem.nameTranslations,
       unitPrice: basePrice.toFixed(2),
       quantity: item.quantity,
       totalPrice: itemTotal.toFixed(2),
@@ -133,7 +138,8 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
       // Customization data (snapshot at order time)
       selectedVariantId: variantData?.id || null,
       variantName: variantData?.name || null,
-      variantPrice: variantData?.price?.toFixed(2) || null,
+      variantNameTranslations: variantData?.nameTranslations || null,
+      variantPrice: variantData?.price || null,
       selectedModifiers: modifiersData,
       customizationAmount: customizationAmount.toFixed(2),
     });
@@ -475,22 +481,23 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
   const order = orderRows[0];
   console.log("📝 New OPEN order created:", order.id, "Payment status:", order.paymentStatus);
 
-  // Create order items with customization data
   const orderItemsData = processedItems.map((item) => ({
     restaurantId,
     orderId: order.id,
     menuItemId: item.menuItemId,
     itemName: item.itemName,
+    itemNameTranslations: item.itemNameTranslations || {},
     unitPrice: item.unitPrice,
     quantity: item.quantity,
     totalPrice: item.totalPrice,
-    notes: item.notes,
+    notes: item.notes || null,
     // Customization fields
-    selectedVariantId: item.selectedVariantId,
-    variantName: item.variantName,
-    variantPrice: item.variantPrice,
-    selectedModifiers: sql`${JSON.stringify(item.selectedModifiers)}::jsonb`,
-    customizationAmount: item.customizationAmount,
+    selectedVariantId: item.selectedVariantId || null,
+    variantName: item.variantName || null,
+    variantNameTranslations: item.variantNameTranslations || {},
+    variantPrice: item.variantPrice || null,
+    selectedModifiers: sql`${JSON.stringify(item.selectedModifiers || [])}::jsonb`,
+    customizationAmount: item.customizationAmount || "0",
   }));
 
   const createdItems = await db
@@ -862,9 +869,77 @@ export async function updateOrderStatus(restaurantId, orderId, status) {
 
   const updated = rows[0] || null;
   if (updated) {
+    // Sync order items status for kitchen/waiter KDS UI updates
+    if (status === "PREPARING") {
+      await db.update(orderItems)
+        .set({ status: "PREPARING" })
+        .where(and(
+          eq(orderItems.orderId, orderId),
+          eq(orderItems.status, "PENDING")
+        ));
+    } else if (status === "READY") {
+      await db.update(orderItems)
+        .set({ status: "READY" })
+        .where(and(
+          eq(orderItems.orderId, orderId),
+          inArray(orderItems.status, ["PENDING", "PREPARING"])
+        ));
+    } else if (status === "SERVED") {
+      await db.update(orderItems)
+        .set({ status: "SERVED" })
+        .where(and(
+          eq(orderItems.orderId, orderId),
+          inArray(orderItems.status, ["PENDING", "PREPARING", "READY"])
+        ));
+    }
+
     emitOrderStatusChanged(restaurantId, updated);
   }
   return updated;
+}
+
+/**
+ * Update individual order item status
+ * @param {string} restaurantId - Restaurant ID
+ * @param {string} orderId - Order ID
+ * @param {string} orderItemId - Order Item ID
+ * @param {string} status - New status for the item
+ * @returns {Promise<object|null>} Updated order item
+ */
+export async function updateOrderItemStatus(restaurantId, orderId, orderItemId, status) {
+  // Update the individual item's status
+  const rows = await db
+    .update(orderItems)
+    .set({ status })
+    .where(and(
+      eq(orderItems.orderId, orderId),
+      eq(orderItems.id, orderItemId) // We should only update the specific item
+    ))
+    .returning();
+
+  const updatedItem = rows[0] || null;
+
+  if (updatedItem) {
+    // Check if ALL items in the order are now SERVED.
+    // If so, automatically mark the whole order as SERVED.
+    const allItems = await db
+      .select({ status: orderItems.status })
+      .from(orderItems)
+      .where(eq(orderItems.orderId, orderId));
+
+    const allServed = allItems.every(item => item.status === "SERVED");
+    if (allServed) {
+      await updateOrderStatus(restaurantId, orderId, "SERVED");
+    } else {
+      // Just emit that the order has changed so the UI refreshes the item states
+      const updatedOrder = await getOrder(restaurantId, orderId);
+      if (updatedOrder) {
+        emitOrderUpdated(restaurantId, updatedOrder);
+      }
+    }
+  }
+
+  return updatedItem;
 }
 
 /**
@@ -1318,12 +1393,12 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
     items
   );
 
-  // Insert new items with customization data
   const orderItemsData = processedItems.map((item) => ({
     restaurantId,
     orderId,
     menuItemId: item.menuItemId,
     itemName: item.itemName,
+    itemNameTranslations: item.itemNameTranslations || {},
     unitPrice: item.unitPrice,
     quantity: item.quantity,
     totalPrice: item.totalPrice,
@@ -1331,6 +1406,7 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
     // Customization fields
     selectedVariantId: item.selectedVariantId,
     variantName: item.variantName,
+    variantNameTranslations: item.variantNameTranslations || {},
     variantPrice: item.variantPrice,
     selectedModifiers: sql`${JSON.stringify(item.selectedModifiers)}::jsonb`,
     customizationAmount: item.customizationAmount,

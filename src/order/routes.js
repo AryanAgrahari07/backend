@@ -20,6 +20,7 @@ import {
   closeOrder, // ✅ NEW
   listCancelledOrdersSummary,
   removeServiceChargeFromOrder,
+  updateOrderItemStatus,
 } from "./service.js";
 
 const router = express.Router({ mergeParams: true });
@@ -318,6 +319,37 @@ export function registerOrderRoutes(app) {
       }
 
       res.json({ order });
+    })
+  );
+
+  // Update order ITEM status
+  router.patch(
+    "/:orderId/items/:orderItemId/status",
+    requireRole("owner", "admin", "platform_admin", "WAITER", "KITCHEN"),
+    rateLimit({ keyPrefix: "orders:item-status", windowSeconds: 60, max: 300 }),
+    asyncHandler(async (req, res) => {
+      const { restaurantId, orderId, orderItemId } = req.params;
+      const parsed = updateOrderStatusSchema.safeParse(req.body);
+
+      if (!parsed.success) {
+        return res.status(400).json({
+          message: "Invalid status",
+          errors: parsed.error.errors,
+        });
+      }
+
+      const updatedItem = await updateOrderItemStatus(
+        restaurantId,
+        orderId,
+        orderItemId,
+        parsed.data.status
+      );
+
+      if (!updatedItem) {
+        return res.status(404).json({ message: "Order item not found" });
+      }
+
+      res.json({ item: updatedItem });
     })
   );
 

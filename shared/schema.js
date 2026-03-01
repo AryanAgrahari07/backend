@@ -142,6 +142,7 @@ export const menuCategories = pgTable("menu_categories", {
     .references(() => restaurants.id, { onDelete: "cascade" }),
   name: varchar("name", { length: 150 }).notNull(),
   sortOrder: integer("sort_order"),
+  nameTranslations: jsonb("name_translations").default(sql`'{}'::jsonb`),
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
@@ -197,7 +198,9 @@ export const menuItems = pgTable("menu_items", {
     .references(() => menuCategories.id, { onDelete: "cascade" }),
 
   name: varchar("name", { length: 200 }).notNull(),
+  nameTranslations: jsonb("name_translations").default(sql`'{}'::jsonb`),
   description: text("description"),
+  descriptionTranslations: jsonb("description_translations").default(sql`'{}'::jsonb`),
   price: numeric("price", { precision: 10, scale: 2 }).notNull(),
 
   imageUrl: text("image_url"),
@@ -233,6 +236,7 @@ export const menuItemVariants = pgTable("menu_item_variants", {
     .references(() => menuItems.id, { onDelete: "cascade" }),
 
   variantName: varchar("variant_name", { length: 100 }).notNull(),
+  variantNameTranslations: jsonb("variant_name_translations").default(sql`'{}'::jsonb`),
   price: numeric("price", { precision: 10, scale: 2 }).notNull().default("0"),
 
   isDefault: boolean("is_default").notNull().default(false),
@@ -254,6 +258,7 @@ export const modifierGroups = pgTable("modifier_groups", {
     .references(() => restaurants.id, { onDelete: "cascade" }),
 
   name: varchar("name", { length: 150 }).notNull(),
+  nameTranslations: jsonb("name_translations").default(sql`'{}'::jsonb`),
   description: text("description"),
   selectionType: selectionTypeEnum("selection_type")
     .notNull()
@@ -284,6 +289,7 @@ export const modifiers = pgTable("modifiers", {
     .references(() => modifierGroups.id, { onDelete: "cascade" }),
 
   name: varchar("name", { length: 150 }).notNull(),
+  nameTranslations: jsonb("name_translations").default(sql`'{}'::jsonb`),
   price: numeric("price", { precision: 10, scale: 2 }).notNull().default("0"),
 
   isDefault: boolean("is_default").notNull().default(false),
@@ -467,7 +473,10 @@ export const orderItems = pgTable("order_items", {
     .notNull()
     .references(() => menuItems.id),
 
+  status: varchar("status", { length: 50 }).notNull().default("PENDING"),
+
   itemName: varchar("item_name", { length: 200 }).notNull(),
+  itemNameTranslations: jsonb("item_name_translations").default(sql`'{}'::jsonb`),
 
   unitPrice: numeric("unit_price", { precision: 10, scale: 2 }).notNull(),
 
@@ -483,6 +492,7 @@ export const orderItems = pgTable("order_items", {
   ),
 
   variantName: varchar("variant_name", { length: 100 }),
+  variantNameTranslations: jsonb("variant_name_translations").default(sql`'{}'::jsonb`),
   variantPrice: numeric("variant_price", { precision: 10, scale: 2 }),
 
   selectedModifiers: jsonb("selected_modifiers").default(

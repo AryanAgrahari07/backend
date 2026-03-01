@@ -1,5 +1,5 @@
 {
-  "id": "924146f4-32f9-4325-8b39-b2727318d477",
+  "id": "e4731d55-9b14-4e1e-bbe1-597500ee0c26",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -459,6 +459,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "name_translations": {
+          "name": "name_translations",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false,
+          "default": "'{}'::jsonb"
+        },
         "sort_order": {
           "name": "sort_order",
           "type": "integer",
@@ -799,6 +806,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "variant_name_translations": {
+          "name": "variant_name_translations",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false,
+          "default": "'{}'::jsonb"
+        },
         "price": {
           "name": "price",
           "type": "numeric(10, 2)",
@@ -905,11 +919,25 @@
           "primaryKey": false,
           "notNull": true
         },
+        "name_translations": {
+          "name": "name_translations",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false,
+          "default": "'{}'::jsonb"
+        },
         "description": {
           "name": "description",
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "description_translations": {
+          "name": "description_translations",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false,
+          "default": "'{}'::jsonb"
         },
         "price": {
           "name": "price",
@@ -1060,6 +1088,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "name_translations": {
+          "name": "name_translations",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false,
+          "default": "'{}'::jsonb"
+        },
         "description": {
           "name": "description",
           "type": "text",
@@ -1172,6 +1207,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "name_translations": {
+          "name": "name_translations",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false,
+          "default": "'{}'::jsonb"
+        },
         "price": {
           "name": "price",
           "type": "numeric(10, 2)",
@@ -1278,11 +1320,25 @@
           "primaryKey": false,
           "notNull": true
         },
+        "status": {
+          "name": "status",
+          "type": "varchar(50)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'PENDING'"
+        },
         "item_name": {
           "name": "item_name",
           "type": "varchar(200)",
           "primaryKey": false,
           "notNull": true
+        },
+        "item_name_translations": {
+          "name": "item_name_translations",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false,
+          "default": "'{}'::jsonb"
         },
         "unit_price": {
           "name": "unit_price",
@@ -1326,6 +1382,13 @@
           "type": "varchar(100)",
           "primaryKey": false,
           "notNull": false
+        },
+        "variant_name_translations": {
+          "name": "variant_name_translations",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false,
+          "default": "'{}'::jsonb"
         },
         "variant_price": {
           "name": "variant_price",

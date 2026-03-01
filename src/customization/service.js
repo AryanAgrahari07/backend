@@ -379,7 +379,7 @@ export async function getMenuForRestaurantWithCustomizations(
   try {
     // Get categories
     const categoriesResult = await client.query(
-      `SELECT id, name, sort_order AS "sortOrder"
+      `SELECT id, name, name_translations AS "nameTranslations", sort_order AS "sortOrder"
        FROM menu_categories
        WHERE restaurant_id = $1 AND is_active = true
        ORDER BY sort_order NULLS LAST, name ASC`,
@@ -391,6 +391,7 @@ export async function getMenuForRestaurantWithCustomizations(
       SELECT id,
               category_id AS "categoryId",
               name,
+              name_translations AS "nameTranslations",
               description,
               price,
               image_url AS "imageUrl",
@@ -425,7 +426,7 @@ export async function getMenuForRestaurantWithCustomizations(
     // === BATCH QUERY 1: Fetch ALL variants for ALL items in one query ===
     const itemIds = items.map(item => item.id);
     const variantsResult = await client.query(
-      `SELECT id, menu_item_id AS "menuItemId", variant_name AS "variantName", 
+      `SELECT id, menu_item_id AS "menuItemId", variant_name AS "variantName", variant_name_translations AS "nameTranslations", 
               price, is_default AS "isDefault", is_available AS "isAvailable",
               sort_order AS "sortOrder"
        FROM menu_item_variants
@@ -448,6 +449,7 @@ export async function getMenuForRestaurantWithCustomizations(
       `SELECT 
          mg.id,
          mg.name,
+         mg.name_translations AS "nameTranslations",
          mg.description,
          mg.selection_type AS "selectionType",
          mg.min_selections AS "minSelections",
@@ -469,7 +471,7 @@ export async function getMenuForRestaurantWithCustomizations(
     if (groups.length > 0) {
       const groupIds = [...new Set(groups.map(g => g.id))]; // Unique group IDs
       const modifiersResult = await client.query(
-        `SELECT id, modifier_group_id AS "modifierGroupId", name, price,
+        `SELECT id, modifier_group_id AS "modifierGroupId", name, name_translations AS "nameTranslations", price,
                 is_default AS "isDefault", is_available AS "isAvailable",
                 sort_order AS "sortOrder"
          FROM modifiers
@@ -495,6 +497,7 @@ export async function getMenuForRestaurantWithCustomizations(
       acc[group.menuItemId].push({
         id: group.id,
         name: group.name,
+        nameTranslations: group.nameTranslations,
         description: group.description,
         selectionType: group.selectionType,
         minSelections: group.minSelections,

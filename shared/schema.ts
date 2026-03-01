@@ -127,6 +127,7 @@ export const menuCategories = pgTable("menu_categories", {
     .notNull()
     .references(() => restaurants.id, { onDelete: "cascade" }),
   name: varchar("name", { length: 150 }).notNull(),
+  nameTranslations: jsonb("name_translations").default(sql`'{}'::jsonb`),
   sortOrder: integer("sort_order"),
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
@@ -140,29 +141,29 @@ export const menuExtractionJobs = pgTable("menu_extraction_jobs", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   restaurantId: varchar("restaurant_id").notNull().references(() => restaurants.id, { onDelete: "cascade" }),
   uploadedBy: varchar("uploaded_by").references(() => users.id),
-  
+
   imageUrl: text("image_url").notNull(),
   imageS3Key: text("image_s3_key").notNull(),
   imageSizeBytes: integer("image_size_bytes"),
   imageHash: varchar("image_hash", { length: 64 }),
-  
+
   status: varchar("status", { length: 50 }).notNull().default("PENDING"),
-  
+
   extractedData: jsonb("extracted_data"),
   extractionConfidence: numeric("extraction_confidence", { precision: 5, scale: 2 }),
   aiModelUsed: varchar("ai_model_used", { length: 50 }),
-  
+
   startedAt: timestamp("started_at", { withTimezone: true }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
   processingTimeMs: integer("processing_time_ms"),
   errorMessage: text("error_message"),
   retryCount: integer("retry_count").default(0),
-  
+
   itemsExtracted: integer("items_extracted").default(0),
   itemsConfirmed: integer("items_confirmed").default(0),
   manualEditsCount: integer("manual_edits_count").default(0),
-  
+
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
@@ -181,11 +182,13 @@ export const menuItems = pgTable("menu_items", {
     .notNull()
     .references(() => menuCategories.id, { onDelete: "cascade" }),
   name: varchar("name", { length: 200 }).notNull(),
+  nameTranslations: jsonb("name_translations").default(sql`'{}'::jsonb`),
   description: text("description"),
+  descriptionTranslations: jsonb("description_translations").default(sql`'{}'::jsonb`),
   price: numeric("price", { precision: 10, scale: 2 }).notNull(),
   imageUrl: text("image_url"),
   isAvailable: boolean("is_available").notNull().default(true),
-  isActive: boolean("is_active").notNull().default(true), 
+  isActive: boolean("is_active").notNull().default(true),
   dietaryTags: varchar("dietary_tags", { length: 50 }).array(), // Veg, Non-Veg, Vegan, etc.
   sortOrder: integer("sort_order"),
   metadata: jsonb("metadata"),
@@ -288,7 +291,9 @@ export const orderItems = pgTable("order_items", {
   restaurantId: varchar("restaurant_id").notNull().references(() => restaurants.id, { onDelete: "cascade" }),
   orderId: varchar("order_id").notNull().references(() => orders.id, { onDelete: "cascade" }),
   menuItemId: varchar("menu_item_id").notNull().references(() => menuItems.id),
+  status: varchar("status", { length: 50 }).notNull().default("PENDING"),
   itemName: varchar("item_name", { length: 200 }).notNull(),
+  itemNameTranslations: jsonb("item_name_translations").default(sql`'{}'::jsonb`),
   unitPrice: numeric("unit_price", { precision: 10, scale: 2 }).notNull(),
   quantity: integer("quantity").notNull(),
   totalPrice: numeric("total_price", { precision: 12, scale: 2 }).notNull(),
@@ -296,6 +301,7 @@ export const orderItems = pgTable("order_items", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   selectedVariantId: varchar("selected_variant_id").references(() => menuItemVariants.id),
   variantName: varchar("variant_name", { length: 100 }),
+  variantNameTranslations: jsonb("variant_name_translations").default(sql`'{}'::jsonb`),
   variantPrice: numeric("variant_price", { precision: 10, scale: 2 }),
   selectedModifiers: jsonb("selected_modifiers").default(sql`'[]'::jsonb`),
   customizationAmount: numeric("customization_amount", { precision: 10, scale: 2 }).default("0"),
@@ -458,15 +464,16 @@ export const menuItemVariants = pgTable("menu_item_variants", {
   menuItemId: varchar("menu_item_id")
     .notNull()
     .references(() => menuItems.id, { onDelete: "cascade" }),
-  
+
   variantName: varchar("variant_name", { length: 100 }).notNull(),
+  variantNameTranslations: jsonb("variant_name_translations").default(sql`'{}'::jsonb`),
   price: numeric("price", { precision: 10, scale: 2 })
     .notNull()
     .default("0"), // Total price for this variant (not adjustment)
   isDefault: boolean("is_default").notNull().default(false),
   isAvailable: boolean("is_available").notNull().default(true),
   sortOrder: integer("sort_order"),
-  
+
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
@@ -481,8 +488,9 @@ export const modifierGroups = pgTable("modifier_groups", {
   restaurantId: varchar("restaurant_id")
     .notNull()
     .references(() => restaurants.id, { onDelete: "cascade" }),
-  
+
   name: varchar("name", { length: 150 }).notNull(),
+  nameTranslations: jsonb("name_translations").default(sql`'{}'::jsonb`),
   description: text("description"),
   selectionType: varchar("selection_type", { length: 20 })
     .notNull()
@@ -492,7 +500,7 @@ export const modifierGroups = pgTable("modifier_groups", {
   isRequired: boolean("is_required").notNull().default(false),
   sortOrder: integer("sort_order"),
   isActive: boolean("is_active").notNull().default(true),
-  
+
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
@@ -510,13 +518,14 @@ export const modifiers = pgTable("modifiers", {
   modifierGroupId: varchar("modifier_group_id")
     .notNull()
     .references(() => modifierGroups.id, { onDelete: "cascade" }),
-  
+
   name: varchar("name", { length: 150 }).notNull(),
+  nameTranslations: jsonb("name_translations").default(sql`'{}'::jsonb`),
   price: numeric("price", { precision: 10, scale: 2 }).notNull().default("0"),
   isDefault: boolean("is_default").notNull().default(false),
   isAvailable: boolean("is_available").notNull().default(true),
   sortOrder: integer("sort_order"),
-  
+
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
@@ -525,7 +534,7 @@ export const modifiers = pgTable("modifiers", {
 // Menu Item Modifier Groups (Junction table)
 //
 export const menuItemModifierGroups = pgTable(
-  "menu_item_modifier_groups", 
+  "menu_item_modifier_groups",
   {
     id: varchar("id")
       .primaryKey()
@@ -537,7 +546,7 @@ export const menuItemModifierGroups = pgTable(
       .notNull()
       .references(() => modifierGroups.id, { onDelete: "cascade" }),
     sortOrder: integer("sort_order"),
-    
+
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   },
   (table) => ({
