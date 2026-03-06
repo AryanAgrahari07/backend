@@ -127,8 +127,46 @@ export function clearRefreshCookie(res) {
     "Max-Age=0",
     "Path=/",
     "HttpOnly",
-    env.refreshCookieSecure ? "Secure" : "",
     `SameSite=${sameSite}`,
   ].filter(Boolean);
   res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+export function startTokenCleanupJob() {
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const LOCK_TTL_SECONDS = 23 * 60 * 60; // 23h — expires just before next interval
+  const LOCK_KEY = 'job:token-cleanup:lock';
+
+  async function runCleanup() {
+    try {
+      // INFRA-3: Distributed lock — only one pod runs cleanup per cycle
+      const { getRedisClient } = await import('../redis/client.js');
+      const redis = getRedisClient();
+      if (redis && redis.status === 'ready') {
+        const acquired = await redis.set(LOCK_KEY, '1', 'EX', LOCK_TTL_SECONDS, 'NX');
+        if (!acquired) return; // Another pod already claimed this cycle
+      }
+
+      await pool.query(
+        `DELETE FROM auth_refresh_tokens 
+         WHERE expires_at < now() OR revoked_at < now() - interval '7 days'`
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[Token Cleanup] Failed to run token cleanup job:", err);
+    }
+  }
+
+  // REL-2 FIX: Run immediately on startup so expired tokens from before
+  // the first deployment don't accumulate for a full 24-hour cycle.
+  runCleanup();
+
+  // REL-2 FIX: Wrap the interval callback so synchronous errors never crash the event loop.
+  // runCleanup already has an internal try/catch for async errors, but this adds a belt-and-suspenders guard.
+  setInterval(() => {
+    runCleanup().catch(err => {
+      // eslint-disable-next-line no-console
+      console.error("[Token Cleanup] Unhandled error in cleanup job:", err);
+    });
+  }, ONE_DAY_MS);
 }

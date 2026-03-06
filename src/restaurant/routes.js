@@ -12,6 +12,8 @@ import {
   updateRestaurant,
   deleteRestaurant,
 } from "./service.js";
+import { getRedisClient } from "../redis/client.js";
+import { cacheGetOrSetJson } from "../redis/cache.js";
 
 const router = express.Router();
 
@@ -47,7 +49,7 @@ const restaurantCreateSchema = z.object({
       lightColor: z.string().optional(),
     })
     .optional(),
-  settings: z.any().optional(),
+  settings: z.record(z.unknown()).optional(), // SEC-1 FIX: Reject arbitrary arrays/strings, require object
 });
 
 const restaurantUpdateSchema = restaurantCreateSchema.partial().extend({
@@ -60,9 +62,40 @@ export function registerRestaurantRoutes(app) {
   router.get(
     "/by-slug/:slug",
     asyncHandler(async (req, res) => {
-      const restaurant = await getRestaurantBySlug(req.params.slug);
-      if (!restaurant) return res.status(404).json({ message: "Not found" });
-      res.json({ restaurant: { id: restaurant.id, name: restaurant.name, slug: restaurant.slug } });
+      const { slug } = req.params;
+      const redisClient = getRedisClient();
+      const cacheKey = `restaurant:slug:${slug}`;
+      const ttlSeconds = 300; // 5 mins cache
+      
+      const producer = async () => {
+        const restaurant = await getRestaurantBySlug(slug);
+        if (!restaurant) {
+          const err = new Error("Not found");
+          err.status = 404;
+          throw err;
+        }
+        return { restaurant: { id: restaurant.id, name: restaurant.name, slug: restaurant.slug } };
+      };
+      
+      if (redisClient) {
+        try {
+          const data = await cacheGetOrSetJson(redisClient, cacheKey, ttlSeconds, producer);
+          res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
+          return res.json(data);
+        } catch (err) {
+          if (err.status === 404) return res.status(404).json({ message: "Not found" });
+          throw err;
+        }
+      }
+      
+      try {
+        const data = await producer();
+        res.setHeader("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
+        return res.json(data);
+      } catch (err) {
+        if (err.status === 404) return res.status(404).json({ message: "Not found" });
+        throw err;
+      }
     }),
   );
 
@@ -80,7 +113,6 @@ export function registerRestaurantRoutes(app) {
       
       // Regular owners and admins only see restaurants they own/manage
       const userId = req.user.id;
-      console.log(userId);
       const restaurants = await listRestaurantsByOwner(userId);
       res.json({ restaurants });
     }),
@@ -95,21 +127,21 @@ export function registerRestaurantRoutes(app) {
       const restaurant = await getRestaurant(req.params.id);
       if (!restaurant) return res.status(404).json({ message: "Not found" });
       
-      // // Platform admin can access any restaurant
-      // if (req.user.role === "platform_admin") {
-      //   return res.json({ restaurant });
-      // }
+      // Platform admin can access any restaurant
+      if (req.user.role === "platform_admin") {
+        return res.json({ restaurant });
+      }
       
-      // // Check if user has access to this restaurant
-      // // For owner/admin: check if they own it
-      // // For WAITER: check if their restaurantId matches
-      // const hasAccess = 
-      //   restaurant.ownerId === req.user.id || 
-      //   req.user.restaurantId === req.params.id;
+      // Check if user has access to this restaurant
+      // For owner/admin: check if they own it
+      // For WAITER: check if their restaurantId matches
+      const hasAccess = 
+        restaurant.ownerId === req.user.id || 
+        req.user.restaurantId === req.params.id;
       
-      // if (!hasAccess) {
-      //   return res.status(403).json({ message: "Access denied" });
-      // }
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Access denied" });
+      }
       
       res.json({ restaurant });
     }),
@@ -154,9 +186,9 @@ export function registerRestaurantRoutes(app) {
       const existing = await getRestaurant(req.params.id);
       if (!existing) return res.status(404).json({ message: "Not found" });
       
-      // if (req.user.role !== "platform_admin" && existing.ownerId !== req.user.id) {
-      //   return res.status(403).json({ message: "Access denied" });
-      // }
+      if (req.user.role !== "platform_admin" && existing.ownerId !== req.user.id) {
+        return res.status(403).json({ message: "Access denied" });
+      }
       
       const restaurant = await updateRestaurant(req.params.id, parsed.data);
       res.json({ restaurant });
@@ -174,9 +206,9 @@ export function registerRestaurantRoutes(app) {
       const existing = await getRestaurant(req.params.id);
       if (!existing) return res.status(404).json({ message: "Not found" });
       
-      // if (req.user.role !== "platform_admin" && existing.ownerId !== req.user.id) {
-      //   return res.status(403).json({ message: "Access denied" });
-      // }
+      if (req.user.role !== "platform_admin" && existing.ownerId !== req.user.id) {
+        return res.status(403).json({ message: "Access denied" });
+      }
       
       const restaurant = await deleteRestaurant(req.params.id);
       res.json({ restaurant, deleted: true });

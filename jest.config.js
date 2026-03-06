@@ -17,6 +17,7 @@ export default {
   coverageDirectory: "coverage",
   coverageReporters: ["text", "lcov", "html"],
   testTimeout: 30000,
+  // setupFilesAfterEnv runs after the test framework is installed (jest.setTimeout etc.)
   setupFilesAfterEnv: ["<rootDir>/tests/setup.js"],
   verbose: true,
   // Run tests serially to avoid database deadlocks

@@ -1,7 +1,7 @@
 import express from "express";
 import { z } from "zod";
 import { asyncHandler } from "../middleware/asyncHandler.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requireRole, requireRestaurantOwnership } from "../middleware/auth.js";
 import { requireActiveSubscription } from "../middleware/subscriptionBlocked.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import {
@@ -44,6 +44,7 @@ export function registerTransactionRoutes(app) {
   app.use(
     "/api/restaurants/:restaurantId/transactions",
     requireAuth,
+    requireRestaurantOwnership, // H1: Tenant isolation — prevent cross-restaurant transaction access
     requireActiveSubscription,
     router
   );
@@ -130,17 +131,20 @@ export function registerTransactionRoutes(app) {
 
       const csvRows = [
         headers.join(','),
-        ...rows.map(row => [
-          `"${row.bill_number}"`,
-          `"${new Date(row.paid_at).toLocaleString()}"`,
-          `"${row.table_or_guest}"`,
-          row.payment_method,
-          row.subtotal,
-          row.gst_amount,
-          row.service_tax_amount,
-          row.discount_amount,
-          row.grand_total,
-        ].join(','))
+        ...rows.map(row => {
+          const escapeCsv = (str) => String(str || '').replace(/"/g, '""');
+          return [
+            `"${escapeCsv(row.bill_number)}"`,
+            `"${new Date(row.paid_at).toLocaleString()}"`,
+            `"${escapeCsv(row.table_or_guest)}"`,
+            row.payment_method,
+            row.subtotal,
+            row.gst_amount,
+            row.service_tax_amount,
+            row.discount_amount,
+            row.grand_total,
+          ]
+        })
       ];
 
       const csv = csvRows.join('\n');

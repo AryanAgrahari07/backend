@@ -1,5 +1,5 @@
 import express from "express";
-import { createRedisClient } from "../redis/client.js";
+import { getRedisClient } from "../redis/client.js";
 import { cacheGetOrSetJson } from "../redis/cache.js";
 import {
   getRestaurantBySlug,
@@ -15,64 +15,47 @@ import {
 } from "./service.js";
 import { env } from "../config/env.js";
 import { asyncHandler } from "../middleware/asyncHandler.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requireRole, requireRestaurantOwnership } from "../middleware/auth.js";
 import { requireActiveSubscription } from "../middleware/subscriptionBlocked.js";
 import { z } from "zod";
 import { createPresignedUploadUrl, publicFileUrl } from "../media/s3.js";
 import { v4 as uuidv4 } from "uuid";
 import { rateLimit } from "../middleware/rateLimit.js";
-import { createPgPool } from "../db.js";
 import { getMenuForRestaurantWithCustomizations } from "../customization/service.js";
+import { pool } from "../dbClient.js";
+
+async function invalidateMenuCache(restaurantId) {
+  const redis = getRedisClient();
+  if (!redis || redis.status !== "ready") return;
+  try {
+    let slug = await redis.get(`restaurant:${restaurantId}:slug`);
+    if (!slug) {
+      const r = await pool.query("SELECT slug FROM restaurants WHERE id = $1", [
+        restaurantId,
+      ]);
+      if (!r.rows[0]) return;
+      slug = r.rows[0].slug;
+      await redis.setex(`restaurant:${restaurantId}:slug`, 86400, slug); // Cache for 24 hours
+    }
+    const keys = [
+      `menu:${slug}:all`,
+      `menu:${slug}:veg`,
+      `menu:${slug}:non-veg`,
+    ];
+    await redis.del(...keys);
+  } catch (err) {
+    console.warn("[cache] Menu cache invalidation failed:", err.message);
+  }
+}
 
 const router = express.Router();
-const pool = createPgPool(env.databaseUrl);
 
-let redis = null;
-function getRedis() {
-  if (redis) return redis;
-  if (process.env.REDIS_URL || process.env.REDIS_MODE === "cluster") {
-    redis = createRedisClient();
-  }
-  return redis;
-}
-
-// Helper function to invalidate menu cache
-async function invalidateMenuCache(restaurantId) {
-  const redisClient = getRedis();
-  if (redisClient) {
-    try {
-      const restaurant = await pool.query('SELECT slug FROM restaurants WHERE id = $1', [restaurantId]);
-      if (restaurant.rows[0]) {
-        const slug = restaurant.rows[0].slug;
-        
-        // Delete all dietary filter variants
-        const cacheKeys = [
-          `menu:${slug}:all`,     // Default/no filter
-          `menu:${slug}:veg`,     // Veg filter
-          `menu:${slug}:non-veg`, // Non-veg filter
-        ];
-        
-        // Delete all keys in parallel
-        await Promise.all(
-          cacheKeys.map(key => 
-            redisClient.del(key).catch(err => 
-              console.error(`[menu-routes] Failed to delete cache key ${key}:`, err)
-            )
-          )
-        );
-        
-        console.log(`[menu-routes] Invalidated ${cacheKeys.length} cache keys for slug: ${slug}`);
-      }
-    } catch (err) {
-      console.error('[menu-routes] Cache invalidation error:', err);
-    }
-  }
-}
 
 export function registerMenuRoutes(app) {
-  // Public menu by restaurant slug (for /r/:slug)
+  // Public menu by restaurant slug (for /r/:slug) // REL-6 rate limit to prevent DDoS
   router.get(
     "/public/:slug",
+    rateLimit({ keyPrefix: "public:menu", windowSeconds: 60, max: 200 }),
     asyncHandler(async (req, res) => {
       const { slug } = req.params;
       const { dietary } = req.query; // Accept 'veg', 'non-veg', or 'any' (default)
@@ -80,7 +63,7 @@ export function registerMenuRoutes(app) {
       // Validate dietary filter
       const dietaryFilter = dietary && (dietary === 'veg' || dietary === 'non-veg') ? dietary : null;
       
-      const redisClient = getRedis();
+      const redisClient = getRedisClient();
       // Include filter in cache key for proper cache separation
       const cacheKey = `menu:${slug}:${dietaryFilter || 'all'}`;
       const ttlSeconds = env.menuCacheTtlSec;
@@ -102,10 +85,17 @@ export function registerMenuRoutes(app) {
 
       if (redisClient) {
         const data = await cacheGetOrSetJson(redisClient, cacheKey, ttlSeconds, producer);
+        // PERF-3: Instruct CDN (CloudFlare) to edge-cache the response
+        // Without these headers, CDN always forwards requests to origin even if data is in Redis
+        res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
+        res.setHeader("Vary", "Accept-Encoding");
         return res.json(data);
       }
 
       const data = await producer();
+      // Even without Redis, set cache headers for CDN
+      res.setHeader("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
+      res.setHeader("Vary", "Accept-Encoding");
       return res.json(data);
     }),
   );
@@ -304,6 +294,13 @@ export function registerMenuRoutes(app) {
       }
 
       const contentType = parsed.data.contentType || "image/jpeg";
+
+      // SEC-3 FIX: Only allow image content types to prevent malicious uploads (JS/HTML/etc)
+      const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+      if (!ALLOWED_IMAGE_TYPES.includes(contentType)) {
+        return res.status(400).json({ message: "Unsupported file type for menu image upload." });
+      }
+
       const key = `restaurants/${restaurantId}/menu-items/${itemId}/${uuidv4()}`;
       const uploadUrl = await createPresignedUploadUrl({ key, contentType, expiresIn: 300 });
       const publicUrl = publicFileUrl(key);

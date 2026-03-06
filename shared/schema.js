@@ -10,6 +10,7 @@ import {
   integer,
   pgEnum,
   unique,
+  index,
 } from "drizzle-orm/pg-core";
 
 //
@@ -221,7 +222,10 @@ export const menuItems = pgTable("menu_items", {
 
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  restaurantIdIdx: index("menu_items_restaurant_id_idx").on(table.restaurantId),
+  categoryStatusIdx: index("menu_items_category_status_idx").on(table.restaurantId, table.categoryId, table.isAvailable),
+}));
 
 //
 // MENU VARIANTS
@@ -352,7 +356,10 @@ export const staff = pgTable("staff", {
 
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  restaurantCodeIdx: index("staff_restaurant_code_idx").on(table.restaurantId, table.staffCode),
+  emailIdx: index("staff_email_idx").on(table.email),
+}));
 
 
 // Refresh Tokens
@@ -368,7 +375,9 @@ export const authRefreshTokens = pgTable("auth_refresh_tokens", {
   userAgent: text("user_agent"),
   ip: text("ip"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-});
+}, (table) => ({
+  tokenHashIdx: index("auth_refresh_tokens_hash_idx").on(table.tokenHash),
+}));
 
 
 
@@ -405,7 +414,9 @@ export const tables = pgTable("tables", {
 
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  restaurantStatusIdx: index("tables_restaurant_status_idx").on(table.restaurantId, table.currentStatus),
+}));
 
 export const orders = pgTable("orders", {
   id: varchar("id")
@@ -473,7 +484,10 @@ export const orders = pgTable("orders", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
   closedAt: timestamp("closed_at", { withTimezone: true }),
-});
+}, (table) => ({
+  restaurantStatusDateIdx: index("orders_restaurant_status_date_idx").on(table.restaurantId, table.status, table.createdAt),
+  restaurantTableIdx: index("orders_restaurant_table_idx").on(table.restaurantId, table.tableId),
+}));
 
 
 export const orderItems = pgTable("order_items", {
@@ -525,7 +539,9 @@ export const orderItems = pgTable("order_items", {
   }).default("0"),
 
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  orderRestaurantIdx: index("order_items_order_restaurant_idx").on(table.orderId, table.restaurantId),
+}));
 
 
 
@@ -624,7 +640,9 @@ export const guestQueue = pgTable("guest_queue", {
   cancelledTime: timestamp("cancelled_time", { withTimezone: true }),
 
   notes: text("notes"),
-});
+}, (table) => ({
+  restaurantStatusTimeIdx: index("guest_queue_restaurant_status_time_idx").on(table.restaurantId, table.status, table.entryTime),
+}));
 
 
 export const analyticsEvents = pgTable("analytics_events", {
@@ -643,7 +661,9 @@ export const analyticsEvents = pgTable("analytics_events", {
   metadata: jsonb("metadata"),
 
   occurredAt: timestamp("occurred_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  restaurantEventTimeIdx: index("analytics_events_restaurant_event_time_idx").on(table.restaurantId, table.eventType, table.occurredAt),
+}));
 
 
 export const countries = pgTable("countries", {
@@ -684,3 +704,26 @@ export const currencies = pgTable("currencies", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
 });
 
+
+//
+// INQUIRIES (Landing page reachout form)
+//
+
+export const inquiryStatusEnum = pgEnum("inquiry_status", [
+  "PENDING",
+  "CONTACTED",
+  "CLOSED",
+]);
+
+export const inquiries = pgTable("inquiries", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  fullName: varchar("full_name", { length: 150 }).notNull(),
+  phoneNumber: varchar("phone_number", { length: 30 }).notNull(),
+  restaurantName: varchar("restaurant_name", { length: 200 }).notNull(),
+  message: text("message"),
+  status: inquiryStatusEnum("status").notNull().default("PENDING"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+}, (table) => ({
+  statusCreatedIdx: index("inquiries_status_created_idx").on(table.status, table.createdAt),
+}));

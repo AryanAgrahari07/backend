@@ -1,6 +1,6 @@
-import { pool } from "../dbClient.js";
+import { readPool as pool } from "../dbClient.js";
 import { getTimeRanges } from "./range.js";
-import { getCached, setCached } from "./cache.js";
+import { getRedisClient } from "../redis/client.js";
 
 function safeNumber(value) {
   const n = typeof value === "number" ? value : Number(value);
@@ -286,8 +286,11 @@ export async function getAnalyticsOverview(restaurantId, timeframe, opts) {
   // Cache by restaurant + timeframe + current-range start (so it naturally rolls forward)
   const ranges = getTimeRanges(tf, new Date(), opts);
   const cacheKey = `analytics:overview:${restaurantId}:${tf}:${ranges.current.start.toISOString()}`;
-  const cached = getCached(cacheKey);
-  if (cached) return cached;
+  const redis = getRedisClient();
+  if (redis) {
+    const cached = await redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+  }
 
   const [kpis, revenueSeries, topItems, categoryBreakdown, traffic, tableTurnover] =
     await Promise.all([
@@ -319,7 +322,9 @@ export async function getAnalyticsOverview(restaurantId, timeframe, opts) {
   };
 
   // 30s TTL by default (dashboard polls every 60s in the frontend)
-  setCached(cacheKey, payload, 30_000);
+  if (redis) {
+    await redis.setex(cacheKey, 30, JSON.stringify(payload));
+  }
   return payload;
 }
 

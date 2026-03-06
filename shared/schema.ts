@@ -13,6 +13,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
+import { index } from "drizzle-orm/pg-core";
 
 export const subjectTypeEnum = pgEnum("subject_type", ["user", "staff"]);
 
@@ -47,6 +48,7 @@ export const paymentMethodEnum = pgEnum("payment_method", [
   "CARD",
   "WALLET",
   "OTHER",
+  "DUE",
 ]);
 
 export const staffRoleEnum = pgEnum("staff_role", ["ADMIN", "WAITER", "KITCHEN"]);
@@ -123,6 +125,8 @@ export const restaurants = pgTable("restaurants", {
   subscriptionValidUntil: timestamp("subscription_valid_until", { withTimezone: true }),
   subscriptionStatus: subscriptionStatusEnum("subscription_status").notNull().default("ACTIVE"),
   isActive: boolean("is_active").notNull().default(true),
+  /** Monotonically increasing per-restaurant invoice counter. Used for unique INV-XXXXXX bill numbers. */
+  invoiceCounter: integer("invoice_counter").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
@@ -149,6 +153,10 @@ export const subscriptions = pgTable("subscriptions", {
   failureReason: text("failure_reason"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+}, (table) => {
+  return {
+    restaurantIdIdx: index("subscriptions_restaurant_id_idx").on(table.restaurantId),
+  };
 });
 
 //
@@ -167,7 +175,10 @@ export const menuCategories = pgTable("menu_categories", {
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  // M3: Every menu load filters by restaurantId — without this index it's a full-table scan
+  restaurantIdIdx: index("menu_categories_restaurant_id_idx").on(table.restaurantId),
+}));
 
 //
 // Menu extraction jobs - MOVED BEFORE menuItems
@@ -232,6 +243,11 @@ export const menuItems = pgTable("menu_items", {
   extractionJobId: varchar("extraction_job_id").references(() => menuExtractionJobs.id, { onDelete: "set null" }),
   isAiExtracted: boolean("is_ai_extracted").default(false),
   extractionConfidence: numeric("extraction_confidence", { precision: 5, scale: 2 }),
+}, (table) => {
+  return {
+    restaurantIdIdx: index("menu_items_restaurant_id_idx").on(table.restaurantId),
+    categoryStatusIdx: index("menu_items_category_status_idx").on(table.restaurantId, table.categoryId, table.isAvailable),
+  };
 });
 
 //
@@ -257,6 +273,12 @@ export const staff = pgTable("staff", {
   lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+}, (table) => {
+  return {
+    restaurantCodeIdx: index("staff_restaurant_code_idx").on(table.restaurantId, table.staffCode),
+    emailIdx: index("staff_email_idx").on(table.email),
+    emailLowerIdx: index("staff_email_lower_idx").on(sql`lower(${table.email})`),
+  };
 });
 
 //
@@ -273,6 +295,10 @@ export const authRefreshTokens = pgTable("auth_refresh_tokens", {
   userAgent: text("user_agent"),
   ip: text("ip"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => {
+  return {
+    tokenHashIdx: index("auth_refresh_tokens_hash_idx").on(table.tokenHash),
+  };
 });
 
 //
@@ -297,6 +323,10 @@ export const tables = pgTable("tables", {
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+}, (table) => {
+  return {
+    restaurantStatusIdx: index("tables_restaurant_status_idx").on(table.restaurantId, table.currentStatus),
+  };
 });
 
 
@@ -336,7 +366,13 @@ export const orders = pgTable("orders", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
   closedAt: timestamp("closed_at", { withTimezone: true }),
-});
+}, (table) => ({
+  restaurantStatusDateIdx: index("orders_restaurant_status_date_idx").on(table.restaurantId, table.status, table.createdAt),
+  restaurantTableIdx: index("orders_restaurant_table_idx").on(table.restaurantId, table.tableId),
+  // H7: updatedAt index for queries filtering "what changed since X"
+  restaurantUpdatedAtIdx: index("orders_restaurant_updated_at_idx").on(table.restaurantId, table.updatedAt),
+  openOrdersIdx: index("orders_open_table_idx").on(table.restaurantId, table.tableId, table.isClosed).where(sql`is_closed = false`),
+}));
 
 //
 // Order items
@@ -354,12 +390,19 @@ export const orderItems = pgTable("order_items", {
   totalPrice: numeric("total_price", { precision: 12, scale: 2 }).notNull(),
   notes: text("notes"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+  // BUG-6: Added updatedAt so KDS can track when item status changes (PENDING → PREPARING → COMPLETED)
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
   selectedVariantId: varchar("selected_variant_id").references(() => menuItemVariants.id),
   variantName: varchar("variant_name", { length: 100 }),
   variantNameTranslations: jsonb("variant_name_translations").default(sql`'{}'::jsonb`),
   variantPrice: numeric("variant_price", { precision: 10, scale: 2 }),
   selectedModifiers: jsonb("selected_modifiers").default(sql`'[]'::jsonb`),
   customizationAmount: numeric("customization_amount", { precision: 10, scale: 2 }).default("0"),
+}, (table) => {
+  return {
+    orderRestaurantIdx: index("order_items_order_restaurant_idx").on(table.orderId, table.restaurantId),
+    restaurantCreatedAtIdx: index("order_items_restaurant_created_idx").on(table.restaurantId, table.createdAt).where(sql`status != 'CANCELLED'`),
+  };
 });
 
 //
@@ -397,6 +440,15 @@ export const transactions = pgTable("transactions", {
   paymentReference: varchar("payment_reference", { length: 100 }),
   paidAt: timestamp("paid_at", { withTimezone: true }).defaultNow(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+}, (table) => {
+  return {
+    restaurantIdIdx: index("transactions_restaurant_id_idx").on(table.restaurantId),
+    restaurantCreatedIdx: index("transactions_restaurant_created_idx").on(table.restaurantId, table.createdAt),
+    // BUG-2: Unique constraint prevents duplicate transactions from payment race conditions
+    // Two concurrent requests hitting updatePaymentStatus both check "no transaction exists" —
+    // without this constraint, both would INSERT causing two bills for one order.
+    orderIdUnique: unique("transactions_order_id_unique").on(table.orderId),
+  };
 });
 
 //
@@ -420,7 +472,10 @@ export const inventoryItems = pgTable("inventory_items", {
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  // M2: Without this, every inventory query is a full scan across all restaurants' items
+  restaurantIdIdx: index("inventory_items_restaurant_id_idx").on(table.restaurantId),
+}));
 
 //
 // Guest queue / waitlist
@@ -441,6 +496,10 @@ export const guestQueue = pgTable("guest_queue", {
   seatedTime: timestamp("seated_time", { withTimezone: true }),
   cancelledTime: timestamp("cancelled_time", { withTimezone: true }),
   notes: text("notes"),
+}, (table) => {
+  return {
+    restaurantStatusTimeIdx: index("guest_queue_restaurant_status_time_idx").on(table.restaurantId, table.status, table.entryTime),
+  };
 });
 
 //
@@ -457,6 +516,10 @@ export const analyticsEvents = pgTable("analytics_events", {
   menuItemId: varchar("menu_item_id").references(() => menuItems.id),
   metadata: jsonb("metadata"),
   occurredAt: timestamp("occurred_at", { withTimezone: true }).defaultNow(),
+}, (table) => {
+  return {
+    restaurantEventTimeIdx: index("analytics_events_restaurant_event_time_idx").on(table.restaurantId, table.eventType, table.occurredAt),
+  };
 });
 
 //
@@ -531,7 +594,11 @@ export const menuItemVariants = pgTable("menu_item_variants", {
 
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  // BUG-5: Missing index — every order placement queried variants without index = full table scan
+  restaurantIdIdx: index("menu_item_variants_restaurant_id_idx").on(table.restaurantId),
+  menuItemIdIdx: index("menu_item_variants_menu_item_id_idx").on(table.menuItemId),
+}));
 
 //
 // Modifier Groups (Grouping for customizations)
@@ -558,7 +625,10 @@ export const modifierGroups = pgTable("modifier_groups", {
 
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  // BUG-5: Missing index — modifier group queries without restaurant_id index = full table scan
+  restaurantIdIdx: index("modifier_groups_restaurant_id_idx").on(table.restaurantId),
+}));
 
 //
 // Modifiers (Individual customization options)
@@ -583,7 +653,11 @@ export const modifiers = pgTable("modifiers", {
 
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => ({
+  // BUG-5: Missing indexes — modifier queries on every order pass without these = full table scans
+  restaurantIdIdx: index("modifiers_restaurant_id_idx").on(table.restaurantId),
+  modifierGroupIdx: index("modifiers_group_id_idx").on(table.modifierGroupId),
+}));
 
 //
 // Menu Item Modifier Groups (Junction table)
@@ -650,3 +724,30 @@ export type InventoryItem = typeof inventoryItems.$inferSelect;
 export type Staff = typeof staff.$inferSelect;
 export type GuestQueue = typeof guestQueue.$inferSelect;
 export type AnalyticsEvent = typeof analyticsEvents.$inferSelect;
+
+
+//
+// INQUIRIES (Landing page reachout form)
+//
+
+export const inquiryStatusEnum = pgEnum("inquiry_status", [
+  "PENDING",
+  "CONTACTED",
+  "CLOSED",
+]);
+
+export const inquiries = pgTable("inquiries", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  fullName: varchar("full_name", { length: 150 }).notNull(),
+  phoneNumber: varchar("phone_number", { length: 30 }).notNull(),
+  restaurantName: varchar("restaurant_name", { length: 200 }).notNull(),
+  message: text("message"),
+  status: inquiryStatusEnum("status").notNull().default("PENDING"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+}, (table) => ({
+  statusCreatedIdx: index("inquiries_status_created_idx").on(table.status, table.createdAt),
+}));
+
+export type Inquiry = typeof inquiries.$inferSelect;
+export type InsertInquiry = typeof inquiries.$inferInsert;

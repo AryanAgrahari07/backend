@@ -35,6 +35,14 @@ if (!testDbUrl) {
   // Set flag for tests to check
   process.env.SKIP_TESTS_NO_DB = "true";
 } else {
-  process.env.DATABASE_URL = testDbUrl;
-  process.env.SKIP_TESTS_NO_DB = "false";
+  // Point all three pool URL env-vars at the same test DB.
+  // env.js reads:
+  //   databaseWriteUrl: process.env.DATABASE_WRITE_URL || DATABASE_URL
+  //   databaseReadUrl:  process.env.DATABASE_READ_URL  || DATABASE_URL
+  // Without these, readPool may connect to a different host and trip the
+  // circuit-breaker, causing all read operations to fail during tests.
+  process.env.DATABASE_URL       = testDbUrl;
+  process.env.DATABASE_WRITE_URL = testDbUrl;  // → env.databaseWriteUrl
+  process.env.DATABASE_READ_URL  = testDbUrl;  // → env.databaseReadUrl
+  process.env.SKIP_TESTS_NO_DB   = "false";
 }

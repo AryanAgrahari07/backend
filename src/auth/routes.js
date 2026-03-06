@@ -19,6 +19,10 @@ import {
   revokeRefreshTokenValue,
   setRefreshCookie,
 } from "./refreshTokens.js";
+import { getRedisClient } from "../redis/client.js";
+import { randomUUID } from "crypto";
+
+import { wsTicketMemoryFallback } from "./wsTicketStore.js";
 
 const router = express.Router();
 
@@ -47,9 +51,11 @@ export function registerAuthRoutes(app) {
   // Dev-only registration endpoint (disable in prod via ALLOW_DEV_REGISTER=false)
   router.post(
     "/register",
-    // rateLimit({ keyPrefix: "auth:register", windowSeconds: 60, max: 5 }),
+    rateLimit({ keyPrefix: "auth:register", windowSeconds: 60, max: 5 }),
     asyncHandler(async (req, res) => {
-      if (env.isProd && !env.allowDevRegister) {
+      // SEC-4: Block in prod AND staging environments regardless of the flag
+      const isRestrictedEnv = env.isProd || process.env.NODE_ENV === "staging";
+      if (isRestrictedEnv && !env.allowDevRegister) {
         return res.status(403).json({ message: "Registration disabled" });
       }
 
@@ -96,7 +102,7 @@ export function registerAuthRoutes(app) {
 
   router.post(
     "/login",
-    // rateLimit({ keyPrefix: "auth:login", windowSeconds: 60, max: 10 }),
+    rateLimit({ keyPrefix: "auth:login", windowSeconds: 60, max: 10 }),
     passport.authenticate("local", { session: true }),
     asyncHandler(async (req, res) => {
       const user = req.user;
@@ -130,23 +136,31 @@ export function registerAuthRoutes(app) {
   );
 
 // Staff login (waiter / kitchen / staff-admin) using email + passcode
-// Staff login (waiter / kitchen / staff-admin) using email + passcode
+// PERF-6: Stricter rate limit for short PIN brute-force prevention
 router.post(
   "/staff/login",
-  rateLimit({ keyPrefix: "auth:staff-login", windowSeconds: 60, max: 20 }),
+  rateLimit({ keyPrefix: "auth:staff-login", windowSeconds: 60, max: 5 }),
   asyncHandler(async (req, res) => {
     // Terminal mode staff login: prefer staffId + passcode.
-    // Backwards compatible: email + passcode.
+    // SEC-2: restaurantId is now REQUIRED when using staffCode or staffId (not email).
+    // Without it, queries span all restaurants — potential cross-tenant data leakage if codes collide.
     const schema = z
       .object({
         staffCode: z.string().min(2).optional(),
         staffId: z.string().min(1).optional(), // legacy
-        email: z.string().email().optional(), // legacy
+        email: z.string().email().optional(),
         restaurantId: z.string().min(1).optional(),
         passcode: z.string().min(4).max(50),
       })
       .refine((v) => !!(v.staffCode || v.staffId || v.email), {
         message: "staffCode, staffId, or email is required",
+      })
+      // SEC-2: Enforce restaurantId for code/id-based logins
+      .refine((v) => !(v.staffCode && !v.restaurantId), {
+        message: "restaurantId is required when using staffCode",
+      })
+      .refine((v) => !(v.staffId && !v.restaurantId), {
+        message: "restaurantId is required when using staffId",
       });
 
     const parsed = schema.safeParse(req.body || {});
@@ -294,6 +308,30 @@ router.post(
     }),
   );
 
+  router.post(
+    "/ws-ticket",
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const user = req.user;
+      const ticket = randomUUID();
+      const payload = JSON.stringify({
+        id: user.id || user.sub,
+        email: user.email,
+        role: user.role,
+        restaurantId: user.restaurantId,
+      });
+
+      const redis = getRedisClient();
+      if (redis && redis.status === 'ready') {
+        await redis.setex(`ws:tick:${ticket}`, 30, payload); // 30 sec TTL
+      } else {
+        wsTicketMemoryFallback.set(ticket, { payload, expiresAt: Date.now() + 30000 });
+      }
+
+      res.json({ ticket });
+    })
+  );
+
   // Exchange refresh token for a new access token (and rotate refresh token)
   router.post(
     "/refresh",
@@ -369,4 +407,5 @@ router.post(
 
   app.use("/api/auth", router);
 }
+
 

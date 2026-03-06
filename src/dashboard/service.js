@@ -1,5 +1,8 @@
-import { pool } from "../dbClient.js";
+// PERF-2 FIX: Use readPool for all dashboard read queries (was using write pool)
+import { readPool as pool } from "../dbClient.js";
 import { getTimeRanges } from "../analytics/range.js";
+import { getRedisClient } from "../redis/client.js";
+import { cacheGetOrSetJson } from "../redis/cache.js";
 
 export async function getTableStats(restaurantId) {
   const query = `
@@ -145,6 +148,7 @@ export async function getWeeklyScanActivity(restaurantId) {
   }));
 }
 
+// PERF-3 FIX: Use lateral join instead of correlated subquery for item count
 export async function getRecentOrders(restaurantId, limit = 5) {
   const query = `
     SELECT 
@@ -155,13 +159,12 @@ export async function getRecentOrders(restaurantId, limit = 5) {
       o.guest_name,
       o.created_at,
       t.table_number,
-      (
-        SELECT COUNT(*) 
-        FROM order_items oi 
-        WHERE oi.order_id = o.id
-      ) as item_count
+      COALESCE(ic.item_count, 0) as item_count
     FROM orders o
     LEFT JOIN tables t ON t.id = o.table_id
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*)::int AS item_count FROM order_items oi WHERE oi.order_id = o.id
+    ) ic ON TRUE
     WHERE o.restaurant_id = $1
       AND o.status != 'CANCELLED'
     ORDER BY o.created_at DESC
@@ -182,26 +185,38 @@ export async function getRecentOrders(restaurantId, limit = 5) {
   }));
 }
 
+// PERF-5 FIX: Add Redis caching to dashboard summary (15s TTL)
 export async function getDashboardSummary(restaurantId) {
-  const [
-    tableStats,
-    orderStats,
-    queueStats,
-    scanActivity,
-    recentOrders
-  ] = await Promise.all([
-    getTableStats(restaurantId),
-    getOrderStats(restaurantId),
-    getQueueStats(restaurantId),
-    getWeeklyScanActivity(restaurantId),
-    getRecentOrders(restaurantId, 5)
-  ]);
+  const redis = getRedisClient();
+  const cacheKey = `dashboard:summary:${restaurantId}`;
+  const ttlSeconds = 15;
 
-  return {
-    tableStats,
-    orderStats,
-    queueStats,
-    scanActivity,
-    recentOrders
+  const producer = async () => {
+    const [
+      tableStats,
+      orderStats,
+      queueStats,
+      scanActivity,
+      recentOrders
+    ] = await Promise.all([
+      getTableStats(restaurantId),
+      getOrderStats(restaurantId),
+      getQueueStats(restaurantId),
+      getWeeklyScanActivity(restaurantId),
+      getRecentOrders(restaurantId, 5)
+    ]);
+
+    return {
+      tableStats,
+      orderStats,
+      queueStats,
+      scanActivity,
+      recentOrders
+    };
   };
+
+  if (redis) {
+    return cacheGetOrSetJson(redis, cacheKey, ttlSeconds, producer);
+  }
+  return producer();
 }

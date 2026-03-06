@@ -1,4 +1,4 @@
-import { pool } from "../dbClient.js";
+import { pool as writePool, readPool as pool } from "../dbClient.js";
 
 export async function listStaff(restaurantId) {
   const result = await pool.query(
@@ -21,7 +21,7 @@ function rolePrefix(role) {
 async function generateNextStaffCode(restaurantId, role) {
   const prefix = rolePrefix(role);
   const like = `${prefix}-%`;
-  const r = await pool.query(
+  const r = await writePool.query(
     `SELECT staff_code AS "staffCode"
      FROM staff
      WHERE restaurant_id = $1 AND staff_code LIKE $2
@@ -45,7 +45,7 @@ export async function createStaff(restaurantId, data) {
     const staffCode = await generateNextStaffCode(restaurantId, role);
 
     try {
-      const result = await pool.query(
+      const result = await writePool.query(
         `INSERT INTO staff
           (restaurant_id, staff_code, full_name, phone_number, email, role, passcode_hash, is_active)
          VALUES
@@ -93,7 +93,7 @@ export async function updateStaff(restaurantId, staffId, data) {
   values.push(restaurantId);
   values.push(staffId);
 
-  const result = await pool.query(
+  const result = await writePool.query(
     `UPDATE staff
      SET ${fields.join(", ")}, updated_at = now()
      WHERE restaurant_id = $${idx} AND id = $${idx + 1}
@@ -104,7 +104,7 @@ export async function updateStaff(restaurantId, staffId, data) {
 }
 
 export async function deactivateStaff(restaurantId, staffId) {
-  const result = await pool.query(
+  const result = await writePool.query(
     `UPDATE staff
      SET is_active = false, updated_at = now()
      WHERE restaurant_id = $1 AND id = $2

@@ -37,6 +37,13 @@ export async function createPresignedUploadUrl({ key, contentType, expiresIn = 3
 export function publicFileUrl(key) {
   if (!env.s3Bucket || !env.s3Region) return null;
 
+  // INFRA: CDN gap — Route image URLs through CloudFront when configured.
+  // Set AWS_CLOUDFRONT_URL=https://d1234abcd.cloudfront.net to enable.
+  // All existing image URLs will automatically serve from CDN with zero DB changes.
+  if (env.cdnUrl) {
+    return `${env.cdnUrl.replace(/\/$/, "")}/${key}`;
+  }
+
   if (env.s3Endpoint) {
     // Custom endpoint (e.g., R2/MinIO)
     const base = env.s3Endpoint.replace(/\/$/, "");

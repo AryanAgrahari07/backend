@@ -1,3 +1,16 @@
+/**
+ * Unit tests — Queue Service
+ *
+ * Launch context: ~100 restaurants. Extreme ceiling: 200.
+ * Peak scenario: friday night dinner rush — 20 parties in queue for a busy restaurant.
+ *
+ * Validates:
+ *  - Guest registration, position assignment, wait-time estimation
+ *  - FIFO ordering: oldest WAITING guest gets called first
+ *  - Status transitions (WAITING → CALLED → SEATED / CANCELLED)
+ *  - Isolation: restaurant A's queue doesn't bleed into restaurant B's
+ *  - Latency: queue ops < 150ms (real-time UX requirement)
+ */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "@jest/globals";
 import { createTestPool, cleanDatabase, closePool } from "../utils/db.js";
 import {
@@ -9,187 +22,179 @@ import {
 } from "../../src/queue/service.js";
 import { fixtures } from "../utils/fixtures.js";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { restaurants, guestQueue } from "../../shared/schema.js";
+import { restaurants } from "../../shared/schema.js";
 
-describe("Queue Service - Unit Tests", () => {
-  let pool;
-  let db;
-  let restaurantId;
-  let dbAvailable = false;
+let pool, db;
+let restaurantId;
+let dbAvailable = false;
 
+const elapsed = (start) => {
+  const [s, ns] = process.hrtime(start);
+  return s * 1000 + ns / 1e6;
+};
+
+describe("Queue Service — Unit Tests (Launch Scale)", () => {
   beforeAll(async () => {
-    // Skip if database not configured
-    if (process.env.SKIP_TESTS_NO_DB === "true") {
-      console.log("⚠️  Skipping tests - TEST_DATABASE_URL not configured");
-      dbAvailable = false;
-      return;
-    }
-    
     const testDbUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
-    
-    if (!testDbUrl) {
-      console.log("⚠️  Skipping tests - TEST_DATABASE_URL not configured");
-      dbAvailable = false;
-      return;
-    }
-    
+    if (!testDbUrl) { console.warn("⚠️  Skipping — no DB URL"); return; }
     try {
       pool = createTestPool();
-      db = drizzle(pool);
-      // Test connection
+      db   = drizzle(pool);
       await pool.query("SELECT 1");
       await cleanDatabase(pool);
       dbAvailable = true;
-    } catch (error) {
-      console.warn(`⚠️  Database connection failed: ${error.message}`);
-      console.warn("   Tests will be skipped. Set TEST_DATABASE_URL to run tests.");
-      dbAvailable = false;
-      if (pool) {
-        try {
-          await closePool(pool);
-        } catch {
-          // Ignore cleanup errors
-        }
-        pool = null;
-      }
+    } catch (err) {
+      console.warn(`⚠️  DB unavailable: ${err.message}`);
     }
   });
 
-  afterAll(async () => {
-    if (pool) {
-      await closePool(pool);
-    }
-  });
+  afterAll(async () => { if (pool) await closePool(pool); });
 
   beforeEach(async () => {
-    if (!dbAvailable || !pool || !db) return;
-    
+    if (!dbAvailable) return;
     await cleanDatabase(pool);
-
-    // Create test restaurant
     const restaurant = fixtures.restaurant();
     restaurantId = restaurant.id;
     await db.insert(restaurants).values(restaurant);
   });
 
+  // ──────────────────────────────────────────────────────────────────────────────
   describe("registerInQueue", () => {
-    it("should register guest in queue with position and wait time", async () => {
+    it("registers first guest with position 1 and a positive wait estimate", async () => {
       if (!dbAvailable) return;
-      const queueData = {
-        guestName: "John Doe",
+      const t = process.hrtime();
+      const entry = await registerInQueue(restaurantId, {
+        guestName: "Priya Patel",
         partySize: 2,
-        phoneNumber: "+1234567890",
-      };
+        phoneNumber: "+919876543210",
+      });
+      const ms = elapsed(t);
 
-      const entry = await registerInQueue(restaurantId, queueData);
-
-      expect(entry).toBeDefined();
-      expect(entry.guestName).toBe("John Doe");
-      expect(entry.partySize).toBe(2);
+      expect(entry.guestName).toBe("Priya Patel");
       expect(entry.status).toBe("WAITING");
       expect(entry.position).toBe(1);
       expect(entry.estimatedWaitMinutes).toBeGreaterThan(0);
+      expect(ms).toBeLessThan(150);
     });
 
-    it("should calculate correct position for multiple guests", async () => {
+    it("increments position correctly for multiple guests", async () => {
       if (!dbAvailable) return;
-      await registerInQueue(restaurantId, {
-        guestName: "Guest 1",
-        partySize: 2,
-      });
+      for (let i = 1; i <= 5; i++) {
+        const e = await registerInQueue(restaurantId, { guestName: `Guest ${i}`, partySize: 2 });
+        expect(e.position).toBe(i);
+      }
+    });
 
-      await registerInQueue(restaurantId, {
-        guestName: "Guest 2",
-        partySize: 4,
-      });
+    it("larger party gets higher estimated wait", async () => {
+      if (!dbAvailable) return;
+      const small = await registerInQueue(restaurantId, { guestName: "Small", partySize: 1 });
+      const large = await registerInQueue(restaurantId, { guestName: "Large", partySize: 8 });
+      // Large party should have >= wait than small (more seats needed)
+      expect(large.estimatedWaitMinutes).toBeGreaterThanOrEqual(small.estimatedWaitMinutes);
+    });
 
-      const entry3 = await registerInQueue(restaurantId, {
-        guestName: "Guest 3",
-        partySize: 2,
-      });
+    it("does NOT mix queues across different restaurants", async () => {
+      if (!dbAvailable) return;
+      const other = fixtures.restaurant();
+      await db.insert(restaurants).values(other);
 
-      expect(entry3.position).toBe(3);
+      // Register 3 guests at restaurant A
+      for (let i = 0; i < 3; i++) {
+        await registerInQueue(restaurantId, { guestName: `A-${i}`, partySize: 2 });
+      }
+      // First guest at restaurant B should still be position 1
+      const bEntry = await registerInQueue(other.id, { guestName: "B-0", partySize: 2 });
+      expect(bEntry.position).toBe(1);
     });
   });
 
+  // ──────────────────────────────────────────────────────────────────────────────
   describe("getQueueEntry", () => {
-    it("should retrieve queue entry with position", async () => {
+    it("retrieves entry with correct position (< 100 ms)", async () => {
       if (!dbAvailable) return;
-      const entry = await registerInQueue(restaurantId, {
-        guestName: "Test Guest",
-        partySize: 2,
-      });
+      const entry = await registerInQueue(restaurantId, { guestName: "Vikram", partySize: 3 });
 
-      const retrieved = await getQueueEntry(restaurantId, entry.id);
+      const t = process.hrtime();
+      const result = await getQueueEntry(restaurantId, entry.id);
+      const ms = elapsed(t);
 
-      expect(retrieved).toBeDefined();
-      expect(retrieved.id).toBe(entry.id);
-      expect(retrieved.position).toBeDefined();
+      expect(result).toBeDefined();
+      expect(result.id).toBe(entry.id);
+      expect(result.position).toBeDefined();
+      expect(ms).toBeLessThan(100);
     });
 
-    it("should return null for non-existent entry", async () => {
+    it("returns null for non-existent entry", async () => {
       if (!dbAvailable) return;
-      const result = await getQueueEntry(restaurantId, "non-existent-id");
-      expect(result).toBeNull();
+      expect(await getQueueEntry(restaurantId, "ghost-id")).toBeNull();
     });
   });
 
+  // ──────────────────────────────────────────────────────────────────────────────
   describe("updateQueueStatus", () => {
-    it("should update queue status correctly", async () => {
+    it("transitions WAITING → CALLED → SEATED", async () => {
       if (!dbAvailable) return;
-      const entry = await registerInQueue(restaurantId, {
-        guestName: "Test Guest",
-        partySize: 2,
-      });
+      let entry = await registerInQueue(restaurantId, { guestName: "Anita", partySize: 2 });
+      entry = await updateQueueStatus(restaurantId, entry.id, "CALLED");
+      expect(entry.status).toBe("CALLED");
+      entry = await updateQueueStatus(restaurantId, entry.id, "SEATED");
+      expect(entry.status).toBe("SEATED");
+    });
 
-      const updated = await updateQueueStatus(restaurantId, entry.id, "CALLED");
-
-      expect(updated.status).toBe("CALLED");
-      expect(updated.id).toBe(entry.id);
+    it("supports CANCELLED status", async () => {
+      if (!dbAvailable) return;
+      const entry = await registerInQueue(restaurantId, { guestName: "Rahul", partySize: 1 });
+      const updated = await updateQueueStatus(restaurantId, entry.id, "CANCELLED");
+      expect(updated.status).toBe("CANCELLED");
     });
   });
 
-  describe("callNextGuest", () => {
-    it("should call the oldest waiting guest", async () => {
+  // ──────────────────────────────────────────────────────────────────────────────
+  describe("callNextGuest — FIFO", () => {
+    it("calls the oldest WAITING guest first (FIFO)", async () => {
       if (!dbAvailable) return;
-      const entry1 = await registerInQueue(restaurantId, {
-        guestName: "Guest 1",
-        partySize: 2,
-      });
-
-      await registerInQueue(restaurantId, {
-        guestName: "Guest 2",
-        partySize: 4,
-      });
+      const first = await registerInQueue(restaurantId, { guestName: "First", partySize: 2 });
+      await registerInQueue(restaurantId, { guestName: "Second", partySize: 4 });
 
       const called = await callNextGuest(restaurantId);
-
       expect(called).toBeDefined();
-      expect(called.id).toBe(entry1.id);
+      expect(called.id).toBe(first.id);
       expect(called.status).toBe("CALLED");
     });
 
-    it("should return null when no guests waiting", async () => {
+    it("skips non-WAITING guests (already CALLED / SEATED)", async () => {
       if (!dbAvailable) return;
-      const result = await callNextGuest(restaurantId);
-      expect(result).toBeNull();
+      const first  = await registerInQueue(restaurantId, { guestName: "First", partySize: 2 });
+      const second = await registerInQueue(restaurantId, { guestName: "Second", partySize: 2 });
+
+      await updateQueueStatus(restaurantId, first.id, "CALLED");
+      // Now callNext should return second (first is already called)
+      const next = await callNextGuest(restaurantId);
+      expect(next.id).toBe(second.id);
+    });
+
+    it("returns null when queue is empty", async () => {
+      if (!dbAvailable) return;
+      expect(await callNextGuest(restaurantId)).toBeNull();
     });
   });
 
-  describe("estimateWaitTime", () => {
-    it("should estimate wait time based on position and party size", async () => {
+  // ──────────────────────────────────────────────────────────────────────────────
+  describe("estimateWaitTime — realistic dinner rush (20 groups)", () => {
+    it("correctly estimates increasing wait time as queue grows", async () => {
       if (!dbAvailable) return;
-      // Create some queue entries
-      await registerInQueue(restaurantId, { guestName: "G1", partySize: 2 });
-      await registerInQueue(restaurantId, { guestName: "G2", partySize: 4 });
-      
-      const entry = await registerInQueue(restaurantId, {
-        guestName: "G3",
-        partySize: 2,
-      });
-
-      // Wait time should be positive
-      expect(entry.estimatedWaitMinutes).toBeGreaterThan(0);
+      const entries = [];
+      for (let i = 0; i < 20; i++) {
+        entries.push(
+          await registerInQueue(restaurantId, { guestName: `Group ${i}`, partySize: (i % 4) + 1 })
+        );
+      }
+      // Each successive group should have >= wait time than the previous
+      for (let i = 1; i < entries.length; i++) {
+        expect(entries[i].estimatedWaitMinutes).toBeGreaterThanOrEqual(
+          entries[i - 1].estimatedWaitMinutes
+        );
+      }
     });
   });
 });

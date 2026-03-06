@@ -1,7 +1,7 @@
 import express from "express";
 import { z } from "zod";
 import { asyncHandler } from "../middleware/asyncHandler.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requireRole, requireRestaurantOwnership } from "../middleware/auth.js";
 import { requireActiveSubscription } from "../middleware/subscriptionBlocked.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import {
@@ -25,8 +25,14 @@ const router = express.Router({ mergeParams: true });
 const registerQueueSchema = z.object({
   guestName: z.string().min(1).max(150),
   partySize: z.number().int().positive().max(50),
-  phoneNumber: z.string().max(20).optional(),
-  notes: z.string().optional(),
+  // SEC-2: Validate phone number format (E.164-compatible, 10-15 digits, optional leading +)
+  phoneNumber: z
+    .string()
+    .max(20)
+    .regex(/^\+?[0-9]{10,15}$/, "Invalid phone number — must be 10–15 digits")
+    .optional()
+    .or(z.literal("").transform(() => undefined)),
+  notes: z.string().max(500).optional(),
 });
 
 const updateStatusSchema = z.object({
@@ -107,9 +113,16 @@ export function registerQueueRoutes(app) {
   app.use(
     "/api/restaurants/:restaurantId/queue",
     requireAuth,
+    requireRestaurantOwnership,
     requireActiveSubscription,
     router
   );
+
+  const listQuerySchema = z.object({
+    status: z.string().optional(),
+    limit: z.coerce.number().int().positive().max(200).optional().default(50),
+    offset: z.coerce.number().int().min(0).optional().default(0),
+  });
 
   // List queue entries
   router.get(
@@ -118,12 +131,18 @@ export function registerQueueRoutes(app) {
     rateLimit({ keyPrefix: "queue:list", windowSeconds: 60, max: 200 }),
     asyncHandler(async (req, res) => {
       const { restaurantId } = req.params;
-      const { status, limit, offset } = req.query;
+      const parsed = listQuerySchema.safeParse(req.query);
 
-      const filters = {
-        limit: limit ? parseInt(limit) : 50,
-        offset: offset ? parseInt(offset) : 0,
-      };
+      if (!parsed.success) {
+        return res.status(400).json({
+          message: "Invalid query parameters",
+          errors: parsed.error.errors,
+        });
+      }
+
+      const { status, limit, offset } = parsed.data;
+
+      const filters = { limit, offset };
 
       if (status) {
         filters.status = status.includes(",") 
@@ -318,6 +337,11 @@ export function registerQueueRoutes(app) {
     })
   );
 
+  const historyQuerySchema = z.object({
+    limit: z.coerce.number().int().positive().max(200).optional().default(50),
+    offset: z.coerce.number().int().min(0).optional().default(0),
+  });
+
   // Get queue history
   router.get(
     "/history/all",
@@ -325,12 +349,16 @@ export function registerQueueRoutes(app) {
     rateLimit({ keyPrefix: "queue:history", windowSeconds: 60, max: 100 }),
     asyncHandler(async (req, res) => {
       const { restaurantId } = req.params;
-      const { limit, offset } = req.query;
+      const parsed = historyQuerySchema.safeParse(req.query);
 
-      const result = await getQueueHistory(restaurantId, {
-        limit: limit ? parseInt(limit) : 50,
-        offset: offset ? parseInt(offset) : 0,
-      });
+      if (!parsed.success) {
+        return res.status(400).json({
+          message: "Invalid query parameters",
+          errors: parsed.error.errors,
+        });
+      }
+
+      const result = await getQueueHistory(restaurantId, parsed.data);
 
       res.json(result);
     })

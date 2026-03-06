@@ -1,7 +1,7 @@
 import express from "express";
 import { z } from "zod";
 import { asyncHandler } from "../middleware/asyncHandler.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requireRole, requireRestaurantOwnership } from "../middleware/auth.js";
 import { requireActiveSubscription } from "../middleware/subscriptionBlocked.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import {
@@ -33,12 +33,15 @@ const tableStatusSchema = z.object({
   status: z.enum(["AVAILABLE", "OCCUPIED", "RESERVED", "BLOCKED"]),
 });
 
+import { assignWaiterToTable } from "./service.js";
+
 export function registerTableRoutes(app) {
   // Tables scoped to a restaurant
   // Allow staff (WAITER, KITCHEN) to view tables, but only owners/admins can modify
   app.use(
     "/api/restaurants/:restaurantId/tables",
     requireAuth,
+    requireRestaurantOwnership,  // H1: Tenant isolation — prevent cross-restaurant table access
     requireActiveSubscription,
     requireRole("owner", "platform_admin", "admin", "WAITER", "KITCHEN"),
     router
@@ -171,7 +174,7 @@ export function registerTableRoutes(app) {
         return res.status(400).json({ message: "staffId is required (can be null to unassign)" });
       }
       
-      const { assignWaiterToTable } = await import("./service.js");
+      // M4: Removed dynamic import to avoid hot path overhead
       const table = await assignWaiterToTable(restaurantId, tableId, staffId || null);
       if (!table) {
         return res.status(404).json({ message: "Table not found" });

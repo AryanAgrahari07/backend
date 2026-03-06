@@ -2,6 +2,7 @@ import Razorpay from "razorpay";
 import crypto from "crypto";
 import { pool } from "../dbClient.js";
 import { env } from "../config/env.js";
+import { getRedisClient } from "../redis/client.js";
 
 // Export the singleton
 export const razorpay = new Razorpay({
@@ -10,9 +11,8 @@ export const razorpay = new Razorpay({
 });
 
 const PLANS = {
-  STARTER: { amount: env.planStarterPrice, days: 30 },
-  PRO: { amount: env.planProPrice, days: 30 },
-  ENTERPRISE: { amount: env.planEnterprisePrice, days: 30 },
+  STARTER: { amount: 0, days: 7, isTrial: true },
+  PRO: { amount: 700, days: 30 },
 };
 
 export function getAvailablePlans() {
@@ -25,12 +25,63 @@ export async function getCurrentSubscription(restaurantId) {
      FROM restaurants WHERE id = $1`,
     [restaurantId]
   );
-  return result.rows[0];
+  
+  const subData = result.rows[0];
+
+  // Check if they have ever used the STARTER plan
+  const starterCheck = await pool.query(
+    `SELECT id FROM subscriptions WHERE restaurant_id = $1 AND plan = 'STARTER'`,
+    [restaurantId]
+  );
+  
+  // They are eligible ONLY if they have never had a STARTER record AND their current plan is not PRO
+  const isEligibleForTrial = starterCheck.rows.length === 0 && subData?.plan !== 'PRO';
+  
+  return {
+    ...subData,
+    isEligibleForTrial
+  };
 }
 
 export async function createSubscriptionOrder(restaurantId, planId) {
   const plan = PLANS[planId];
   if (!plan) throw new Error("Invalid plan");
+
+  // If it's the free STARTER trial, bypass Razorpay and activate instantly
+  if (plan.amount === 0) {
+    // Check if they ever had a STARTER subscription
+    const existingStarter = await pool.query(
+      `SELECT id FROM subscriptions WHERE restaurant_id = $1 AND plan = 'STARTER' AND status = 'ACTIVE'`,
+      [restaurantId]
+    );
+
+    if (existingStarter.rows.length > 0) {
+      throw new Error("You have already used the 7-day Starter trial.");
+    }
+
+    // Insert active subscription record
+    await pool.query(
+      `INSERT INTO subscriptions (restaurant_id, plan, amount, currency, start_date, end_date, status)
+       VALUES ($1, $2, 0, 'INR', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + ($3 || ' days')::interval, 'ACTIVE')`,
+      [restaurantId, planId, plan.days]
+    );
+
+    // Update restaurant validity
+    const d = new Date();
+    d.setDate(d.getDate() + plan.days);
+    
+    await pool.query(
+      `UPDATE restaurants 
+       SET subscription_valid_until = $1, subscription_status = 'ACTIVE', plan = $2
+       WHERE id = $3`,
+      [d, planId, restaurantId]
+    );
+
+    const redis = getRedisClient();
+    if (redis) await redis.del(`sub:status:${restaurantId}`);
+
+    return { isFree: true, validUntil: d, message: "Starter trial activated successfully." };
+  }
 
   // Create Razorpay order
   const options = {
@@ -60,13 +111,18 @@ export async function createSubscriptionOrder(restaurantId, planId) {
     [restaurantId, planId, plan.amount, "INR", plan.days, order.id]
   );
 
-  return result.rows[0];
+  return { ...result.rows[0], keyId: env.razorpayKeyId || "test_key", isFree: false };
 }
 
 export async function verifyPaymentAndActivate(restaurantId, razorpayOrderId, razorpayPaymentId, razorpaySignature) {
   const keySecret = env.razorpayKeySecret || "test_secret";
   
   if (keySecret !== "test_secret" && !razorpayOrderId.startsWith("mock_")) {
+    // SEC-2: For client-side verification, the signature is: HMAC(orderId | paymentId, keySecret).
+    // This is correct for the Razorpay checkout flow where the signature is returned to the client.
+    // For server-to-server webhook endpoints, req.rawBody (Buffer captured in body parser) must be
+    // used instead of re-serialized JSON (req.body). No server webhook route exists yet — when added,
+    // use: crypto.createHmac('sha256', webhookSecret).update(req.rawBody).digest('hex').
     const body = razorpayOrderId + "|" + razorpayPaymentId;
     const expectedSignature = crypto
       .createHmac("sha256", keySecret)
@@ -79,6 +135,17 @@ export async function verifyPaymentAndActivate(restaurantId, razorpayOrderId, ra
         [razorpayOrderId]
       );
       throw new Error("Invalid payment signature");
+    }
+
+    // Double check with Razorpay API directly to explicitly block cancelled/failed transactions 
+    // that might theoretically have valid signatures from other flows
+    const payment = await razorpay.payments.fetch(razorpayPaymentId);
+    if (payment.status !== 'captured') {
+        await pool.query(
+          `UPDATE subscriptions SET status = 'FAILED', failure_reason = $1 WHERE razorpay_order_id = $2`,
+          [`Payment not captured. Status: ${payment.status}`, razorpayOrderId]
+        );
+        throw new Error(`Payment is not completely successful. Status: ${payment.status}`);
     }
   }
 
@@ -124,6 +191,9 @@ export async function verifyPaymentAndActivate(restaurantId, razorpayOrderId, ra
      WHERE id = $3`,
     [newValidUntil, sub.plan, restaurantId]
   );
+
+  const redis = getRedisClient();
+  if (redis) await redis.del(`sub:status:${restaurantId}`);
 
   return { success: true, validUntil: newValidUntil };
 }

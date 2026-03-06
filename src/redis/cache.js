@@ -25,8 +25,36 @@ export async function cacheSetJson(redis, key, value, ttlSeconds) {
 export async function cacheGetOrSetJson(redis, key, ttlSeconds, producer) {
   const cached = await cacheGetJson(redis, key);
   if (cached !== null) return cached;
-  const fresh = await producer();
-  await cacheSetJson(redis, key, fresh, ttlSeconds);
-  return fresh;
+
+  // Acquire a distributed lock to prevent stampede
+  const lockKey = `lock:${key}`;
+  let locked = await redis.set(lockKey, "1", "EX", 10, "NX");
+
+  // BUG-4: Was recursive — replaced with bounded loop to prevent stack overflow under sustained load
+  let retries = 0;
+  const MAX_RETRIES = 10;
+  while (!locked && retries < MAX_RETRIES) {
+    await new Promise(r => setTimeout(r, 200));
+    retries++;
+    // Check if another instance already populated the cache
+    const cached2 = await cacheGetJson(redis, key);
+    if (cached2 !== null) return cached2;
+    // Re-try acquiring the lock
+    locked = await redis.set(lockKey, "1", "EX", 10, "NX");
+  }
+
+  if (!locked) {
+    // Fail open after max retries: serve fresh data directly from producer
+    // This is safe since each call still returns valid data; we just skip caching
+    return producer();
+  }
+
+  try {
+    const fresh = await producer();
+    await cacheSetJson(redis, key, fresh, ttlSeconds);
+    return fresh;
+  } finally {
+    await redis.del(lockKey);
+  }
 }
 

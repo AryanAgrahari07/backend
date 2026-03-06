@@ -1,4 +1,5 @@
 import bcrypt from "bcryptjs";
+import { sql } from "drizzle-orm";
 import { users, restaurants, tables, menuCategories, staff } from "../../shared/schema.js";
 import { db } from "../dbClient.js";
 import { env } from "../config/env.js";
@@ -27,107 +28,129 @@ export async function completeOnboarding(data) {
 
   // Start a transaction-like operation (ideally use actual transactions in production)
   try {
-    // Step 1: Create user account
+    // Pre-calculate hashes and dates before holding the DB transaction
     const passwordHash = await bcrypt.hash(userData.password, env.bcryptRounds);
     
-    const userRows = await db
-      .insert(users)
-      .values({
-        email: userData.email,
-        passwordHash,
-        fullName: userData.fullName || "",
-        role: userData.role || "owner",
-      })
-      .returning();
-    
-    const user = userRows[0];
+    // Calculate 7-day trial dates for the new restaurant
+    const d = new Date();
+    d.setDate(d.getDate() + 7);
 
-    // Step 2: Create restaurant
-    const restaurantRows = await db
-      .insert(restaurants)
-      .values({
-        ownerId: user.id,
-        name: restaurantData.name,
-        slug: restaurantData.slug,
-        type: restaurantData.type || "Restaurant",
-        addressLine1: restaurantData.addressLine1,
-        addressLine2: restaurantData.addressLine2,
-        city: restaurantData.city,
-        state: restaurantData.state,
-        postalCode: restaurantData.postalCode,
-        country: restaurantData.country || "India",
-        currency: restaurantData.currency || "₹",
-        taxRateGst: restaurantData.taxRateGst || "5.00",
-        taxRateService: restaurantData.taxRateService || "10.00",
-        plan: restaurantData.plan || "STARTER",
-        qrDesign: settings.qrDesign || null,
-        settings: settings.restaurantSettings || null,
-      })
-      .returning();
-    
-    const restaurant = restaurantRows[0];
-
-    // Step 3: Create tables (if provided)
-    let createdTables = [];
-    if (tablesData && tablesData.length > 0) {
-      // Get base URL for QR codes
-      const baseUrl = env.appUrl || "https://qrave.app";
-      
-      const tablesWithQR = tablesData.map((table) => ({
-        restaurantId: restaurant.id,
-        tableNumber: table.tableNumber,
-        capacity: table.capacity || 4,
-        floorSection: table.floorSection || "Main Floor",
-        positionX: table.positionX || null,
-        positionY: table.positionY || null,
-        currentStatus: table.currentStatus || "AVAILABLE",
-        // Generate QR payload for each table
-        qrCodePayload: `${baseUrl}/r/${restaurant.slug}?table=${table.tableNumber}`,
-        qrCodeVersion: 1,
-      }));
-
-      createdTables = await db
-        .insert(tables)
-        .values(tablesWithQR)
-        .returning();
-    }
-
-    // Step 4: Create default menu categories (if provided)
-    let createdCategories = [];
-    if (categoriesData && categoriesData.length > 0) {
-      const categoriesWithRestaurant = categoriesData.map((cat, index) => ({
-        restaurantId: restaurant.id,
-        name: cat.name,
-        sortOrder: cat.sortOrder !== undefined ? cat.sortOrder : index,
-      }));
-
-      createdCategories = await db
-        .insert(menuCategories)
-        .values(categoriesWithRestaurant)
-        .returning();
-    }
-
-    // Step 5: Create admin staff member for the owner (optional)
-    let adminStaff = null;
+    // Prepare admin passcode hash if needed
+    let adminPasscodeHash = null;
     if (settings.createAdminStaff !== false) {
-      const adminPasscodeHash = await bcrypt.hash(
+      adminPasscodeHash = await bcrypt.hash(
         settings.adminPasscode || "1234",
         env.bcryptRounds
       );
-      
-      const staffRows = await db
-        .insert(staff)
+    }
+
+    // BUG-2 FIX: Wrap onboarding DB operations in a transaction
+    const { user, restaurant, createdTables, createdCategories, adminStaff } = await db.transaction(async (tx) => {
+      // Step 1: Create user account
+      const userRows = await tx
+        .insert(users)
         .values({
-          restaurantId: restaurant.id,
-          fullName: userData.fullName || "Admin",
           email: userData.email,
-          role: "ADMIN",
-          passcodeHash: adminPasscodeHash,
+          passwordHash,
+          fullName: userData.fullName || "",
+          role: userData.role || "owner",
         })
         .returning();
       
-      adminStaff = staffRows[0];
-    }
+      const user = userRows[0];
+      
+      // Step 2: Create restaurant
+      const restaurantRows = await tx
+        .insert(restaurants)
+        .values({
+          ownerId: user.id,
+          name: restaurantData.name,
+          slug: restaurantData.slug,
+          type: restaurantData.type || "Restaurant",
+          addressLine1: restaurantData.addressLine1,
+          addressLine2: restaurantData.addressLine2,
+          city: restaurantData.city,
+          state: restaurantData.state,
+          postalCode: restaurantData.postalCode,
+          country: restaurantData.country || "India",
+          currency: restaurantData.currency || "₹",
+          taxRateGst: restaurantData.taxRateGst || "5.00",
+          taxRateService: restaurantData.taxRateService || "10.00",
+          plan: "STARTER",
+          subscriptionValidUntil: d,
+          subscriptionStatus: "ACTIVE",
+          qrDesign: settings.qrDesign || null,
+          settings: settings.restaurantSettings || null,
+        })
+        .returning();
+      
+      const restaurant = restaurantRows[0];
+
+      // Create introductory subscription record in DB for the 7-day starter plan
+      await tx.execute(sql`
+        INSERT INTO subscriptions (restaurant_id, plan, amount, currency, start_date, end_date, status)
+        VALUES (${restaurant.id}, 'STARTER', 0, 'INR', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + '7 days'::interval, 'ACTIVE')
+      `);
+
+      // Step 3: Create tables (if provided)
+      let createdTables = [];
+      if (tablesData && tablesData.length > 0) {
+        // Get base URL for QR codes
+        const baseUrl = env.appUrl || "https://qrave.app";
+        
+        const tablesWithQR = tablesData.map((table) => ({
+          restaurantId: restaurant.id,
+          tableNumber: table.tableNumber,
+          capacity: table.capacity || 4,
+          floorSection: table.floorSection || "Main Floor",
+          positionX: table.positionX || null,
+          positionY: table.positionY || null,
+          currentStatus: table.currentStatus || "AVAILABLE",
+          // Generate QR payload for each table
+          qrCodePayload: `${baseUrl}/r/${restaurant.slug}?table=${table.tableNumber}`,
+          qrCodeVersion: 1,
+        }));
+
+        createdTables = await tx
+          .insert(tables)
+          .values(tablesWithQR)
+          .returning();
+      }
+
+      // Step 4: Create default menu categories (if provided)
+      let createdCategories = [];
+      if (categoriesData && categoriesData.length > 0) {
+        const categoriesWithRestaurant = categoriesData.map((cat, index) => ({
+          restaurantId: restaurant.id,
+          name: cat.name,
+          sortOrder: cat.sortOrder !== undefined ? cat.sortOrder : index,
+        }));
+
+        createdCategories = await tx
+          .insert(menuCategories)
+          .values(categoriesWithRestaurant)
+          .returning();
+      }
+
+      // Step 5: Create admin staff member for the owner (optional)
+      let adminStaff = null;
+      if (adminPasscodeHash) {
+        const staffRows = await tx
+          .insert(staff)
+          .values({
+            restaurantId: restaurant.id,
+            fullName: userData.fullName || "Admin",
+            email: userData.email,
+            role: "ADMIN",
+            passcodeHash: adminPasscodeHash,
+          })
+          .returning();
+        
+        adminStaff = staffRows[0];
+      }
+
+      return { user, restaurant, createdTables, createdCategories, adminStaff };
+    });
 
     // Step 6: Generate QR codes for all tables
     let qrCodes = [];

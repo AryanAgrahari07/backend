@@ -1,5 +1,5 @@
 import { eq, and, inArray } from "drizzle-orm";
-import { tables } from "../../shared/schema.js";
+import { tables, staff } from "../../shared/schema.js";
 import { db } from "../dbClient.js";
 import {
   emitTableCreated,
@@ -27,7 +27,7 @@ export async function listTables(restaurantId) {
   if (waiterIds.length === 0) return tablesList;
 
   // Batch fetch assigned waiter info (remove N+1)
-  const { staff } = await import("../../shared/schema.js");
+
   const waiterRows = await db
     .select({ id: staff.id, fullName: staff.fullName })
     .from(staff)
@@ -61,7 +61,7 @@ export async function getTable(restaurantId, tableId) {
   
   // Enrich with assigned waiter info
   if (table.assignedWaiterId) {
-    const { staff } = await import("../../shared/schema.js");
+
     const waiterRows = await db
       .select({
         id: staff.id,
@@ -175,7 +175,7 @@ export async function updateTableStatus(restaurantId, tableId, status, staffId =
   
   // Enrich with assigned waiter info
   if (table.assignedWaiterId) {
-    const { staff } = await import("../../shared/schema.js");
+
     const waiterRows = await db
       .select({
         id: staff.id,
@@ -249,7 +249,7 @@ export async function assignWaiterToTable(restaurantId, tableId, staffId) {
   
   // Enrich with assigned waiter info
   if (table.assignedWaiterId) {
-    const { staff } = await import("../../shared/schema.js");
+
     const waiterRows = await db
       .select({
         id: staff.id,

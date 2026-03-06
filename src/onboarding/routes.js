@@ -137,6 +137,7 @@ export function registerOnboardingRoutes(app) {
         id: result.user.id,
         email: result.user.email,
         role: result.user.role,
+        restaurantId: result.restaurant.id,
       });
 
       const refreshToken = createRefreshTokenValue();
@@ -215,6 +216,7 @@ export function registerOnboardingRoutes(app) {
         id: result.user.id,
         email: result.user.email,
         role: result.user.role,
+        restaurantId: result.restaurant.id,
       });
 
       const refreshToken = createRefreshTokenValue();

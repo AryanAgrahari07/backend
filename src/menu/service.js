@@ -1,7 +1,7 @@
 import { pool } from "../dbClient.js";
 import { translate } from "@vitalets/google-translate-api";
 
-// Helper to generate translations automatically
+// Helper to generate translations — always returns fast English fallback
 async function generateTranslations(text, targetLang = "hi") {
   if (!text) return {};
   try {
@@ -14,6 +14,36 @@ async function generateTranslations(text, targetLang = "hi") {
     console.error(`[Translation] Failed to translate: "${text}"`, error);
     return { en: text }; // Fallback to English if translation fails
   }
+}
+
+/**
+ * Fire-and-forget translation — saves item first (with English-only fallback),
+ * then asynchronously fetches translations and patches the DB row.
+ * This keeps menu write latency under 50ms regardless of Google API speed.
+ */
+function translateAndPatchAsync(table, idColumn, id, fields) {
+  // `fields` is an object of { columnName: textToTranslate }
+  setImmediate(async () => {
+    try {
+      const updates = [];
+      const values = [];
+      let idx = 1;
+      for (const [column, text] of Object.entries(fields)) {
+        if (!text) continue;
+        const translations = await generateTranslations(text);
+        updates.push(`${column} = $${idx++}`);
+        values.push(JSON.stringify(translations));
+      }
+      if (!updates.length) return;
+      values.push(id);
+      await pool.query(
+        `UPDATE ${table} SET ${updates.join(', ')} WHERE ${idColumn} = $${idx}`,
+        values
+      );
+    } catch (err) {
+      console.error(`[Translation] Background patch failed for ${table} id=${id}:`, err);
+    }
+  });
 }
 
 
@@ -104,18 +134,25 @@ export async function setItemAvailability(restaurantId, itemId, isAvailable) {
 export async function createCategory(restaurantId, data) {
   const { name, sortOrder, nameTranslations } = data;
   
-  // Auto-translate if no translations provided
-  const finalTranslations = nameTranslations && Object.keys(nameTranslations).length > 0 
-    ? nameTranslations 
-    : await generateTranslations(name);
+  // Use caller-provided translations, or English-only fallback (translations patched async below)
+  const initialTranslations = nameTranslations && Object.keys(nameTranslations).length > 0
+    ? nameTranslations
+    : { en: name };
 
   const result = await pool.query(
     `INSERT INTO menu_categories (restaurant_id, name, name_translations, sort_order, is_active)
      VALUES ($1, $2, $3, $4, true)
      RETURNING id, name, name_translations AS "nameTranslations", sort_order AS "sortOrder", is_active AS "isActive"`,
-    [restaurantId, name, finalTranslations, sortOrder ?? null],
+    [restaurantId, name, initialTranslations, sortOrder ?? null],
   );
-  return result.rows[0];
+  const category = result.rows[0];
+
+  // Auto-translate in background if no translations were provided
+  if (!nameTranslations || Object.keys(nameTranslations).length === 0) {
+    translateAndPatchAsync('menu_categories', 'id', category.id, { name_translations: name });
+  }
+
+  return category;
 }
 
 export async function updateCategory(restaurantId, categoryId, data) {
@@ -128,10 +165,7 @@ export async function updateCategory(restaurantId, categoryId, data) {
     values.push(data.name);
 
     if (data.nameTranslations === undefined) {
-      // Name changed but translations not explicitly provided, auto-generate them
-      const newTranslations = await generateTranslations(data.name);
-      fields.push(`name_translations = $${idx++}`);
-      values.push(newTranslations);
+      // Will be patched asynchronously after update returns
     }
   }
   
@@ -161,7 +195,14 @@ export async function updateCategory(restaurantId, categoryId, data) {
      RETURNING id, name, name_translations AS "nameTranslations", sort_order AS "sortOrder", is_active AS "isActive"`,
     values,
   );
-  return result.rows[0] || null;
+  const updated = result.rows[0] || null;
+
+  // If name changed but translations were not explicitly provided, patch async
+  if (updated && data.name !== undefined && data.nameTranslations === undefined) {
+    translateAndPatchAsync('menu_categories', 'id', updated.id, { name_translations: data.name });
+  }
+
+  return updated;
 }
 
 export async function deleteCategory(restaurantId, categoryId) {
@@ -219,17 +260,17 @@ export async function createMenuItem(restaurantId, data) {
     sortOrder,
   } = data;
 
-  const finalNameTranslations = nameTranslations && Object.keys(nameTranslations).length > 0
+  // Use English-only fallback immediately; translations patched async below
+  const initialNameTranslations = nameTranslations && Object.keys(nameTranslations).length > 0
     ? nameTranslations
-    : await generateTranslations(name);
-    
-  let finalDescTranslations = descriptionTranslations && Object.keys(descriptionTranslations).length > 0
-    ? descriptionTranslations
-    : {};
-    
-  if (!descriptionTranslations && description) {
-    finalDescTranslations = await generateTranslations(description);
-  }
+    : { en: name };
+
+  const initialDescTranslations =
+    descriptionTranslations && Object.keys(descriptionTranslations).length > 0
+      ? descriptionTranslations
+      : description
+      ? { en: description }
+      : {};
 
   const result = await pool.query(
     `INSERT INTO menu_items
@@ -244,9 +285,9 @@ export async function createMenuItem(restaurantId, data) {
       restaurantId,
       categoryId,
       name,
-      finalNameTranslations,
+      initialNameTranslations,
       description || null,
-      finalDescTranslations,
+      initialDescTranslations,
       price,
       imageUrl || null,
       isAvailable,
@@ -255,7 +296,19 @@ export async function createMenuItem(restaurantId, data) {
     ],
   );
 
-  return result.rows[0];
+  const item = result.rows[0];
+
+  // Patch translations in background
+  const asyncFields = {};
+  if (!nameTranslations || Object.keys(nameTranslations).length === 0) asyncFields.name_translations = name;
+  if (description && (!descriptionTranslations || Object.keys(descriptionTranslations).length === 0)) {
+    asyncFields.description_translations = description;
+  }
+  if (Object.keys(asyncFields).length > 0) {
+    translateAndPatchAsync('menu_items', 'id', item.id, asyncFields);
+  }
+
+  return item;
 }
 
 export async function updateMenuItem(restaurantId, itemId, data) {
@@ -284,22 +337,17 @@ export async function updateMenuItem(restaurantId, itemId, data) {
     }
   }
   
-  // Auto-translate if name/description changed but translations weren't explicitly provided
-  if (data.name !== undefined && data.nameTranslations === undefined) {
-    const newNameTranslations = await generateTranslations(data.name);
-    fields.push(`name_translations = $${idx}`);
-    values.push(newNameTranslations);
-    idx += 1;
-  }
-  
-  if (data.description !== undefined && data.descriptionTranslations === undefined) {
-    const newDescTranslations = await generateTranslations(data.description);
-    fields.push(`description_translations = $${idx}`);
-    values.push(newDescTranslations);
-    idx += 1;
-  }
+  // Auto-translate if name/description changed but translations weren't explicitly provided (async, non-blocking)
+  const asyncFields = {};
+  if (data.name !== undefined && data.nameTranslations === undefined) asyncFields.name_translations = data.name;
+  if (data.description !== undefined && data.descriptionTranslations === undefined) asyncFields.description_translations = data.description;
 
-  if (!fields.length) return null;
+  if (!fields.length && Object.keys(asyncFields).length === 0) return null;
+  // If only translations need updating (no other field change), do it fully async
+  if (!fields.length) {
+    translateAndPatchAsync('menu_items', 'id', itemId, asyncFields);
+    return { id: itemId }; // Return minimal shape
+  }
 
   values.push(restaurantId);
   values.push(itemId);
@@ -314,7 +362,14 @@ export async function updateMenuItem(restaurantId, itemId, data) {
                dietary_tags AS "dietaryTags", sort_order AS "sortOrder"`,
     values,
   );
-  return result.rows[0] || null;
+  const updatedItem = result.rows[0] || null;
+
+  // Fire background translation if name/description changed without explicit translations
+  if (updatedItem && Object.keys(asyncFields).length > 0) {
+    translateAndPatchAsync('menu_items', 'id', updatedItem.id, asyncFields);
+  }
+
+  return updatedItem;
 }
 
 export async function deleteMenuItem(restaurantId, itemId) {

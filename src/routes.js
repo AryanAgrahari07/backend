@@ -16,6 +16,7 @@ import { registerExtractionRoutes } from "./menu/extraction-routes.js";
 import { registerCustomizationRoutes } from "./customization/routes.js";
 import { registerLogoRoutes } from "./logo/routes.js";
 import { registerSubscriptionRoutes } from "./subscription/routes.js";
+import { registerInquiryRoutes } from "./inquiry/routes.js";
 
 export async function registerRoutes(httpServer, app) {
   // API Routes
@@ -40,6 +41,7 @@ export async function registerRoutes(httpServer, app) {
   registerCustomizationRoutes(app);
   registerLogoRoutes(app);
   registerSubscriptionRoutes(app);
+  registerInquiryRoutes(app);
 
   return httpServer;
 }

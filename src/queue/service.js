@@ -1,6 +1,6 @@
 import { eq, and, desc, sql, inArray } from "drizzle-orm";
 import { guestQueue, restaurants, tables } from "../../shared/schema.js";
-import { db } from "../dbClient.js";
+import { db as writeDb, readDb as db } from "../dbClient.js";
 import {
   emitQueueBulkUpdated,
   emitQueueCalled,
@@ -94,7 +94,7 @@ export async function registerInQueue(restaurantId, data) {
   }
 
   // Create queue entry
-  const queueRows = await db
+  const queueRows = await writeDb
     .insert(guestQueue)
     .values({
       restaurantId,
@@ -248,9 +248,10 @@ export async function getActiveQueue(restaurantId) {
  * @param {string} restaurantId - Restaurant ID
  * @param {string} queueId - Queue entry ID
  * @param {string} status - New status
+ * @param {object} [tx=writeDb] - Optional transaction object to use instead of writeDb
  * @returns {Promise<object|null>} Updated queue entry
  */
-export async function updateQueueStatus(restaurantId, queueId, status) {
+export async function updateQueueStatus(restaurantId, queueId, status, tx = writeDb) {
   const updateData = { status };
 
   // Set timestamp based on status
@@ -262,7 +263,7 @@ export async function updateQueueStatus(restaurantId, queueId, status) {
     updateData.cancelledTime = new Date();
   }
 
-  const rows = await db
+  const rows = await tx
     .update(guestQueue)
     .set(updateData)
     .where(
@@ -276,9 +277,9 @@ export async function updateQueueStatus(restaurantId, queueId, status) {
   const updated = rows[0] || null;
   if (!updated) return null;
 
-  // Hydrate with latest position + wait time (remember: position becomes 0 when not WAITING)
-  const hydrated = await getQueueEntry(restaurantId, queueId);
-  const entry = hydrated || updated;
+  // PERF-1: Avoid N+1 DB round-trips by NOT calling hydrateQueueEntry here.
+  // Instead, emit the updated status directly. (Guests not waiting have position 0).
+  const entry = { ...updated, position: 0, estimatedWaitMinutes: 0 };
 
   emitQueueStatusChanged(restaurantId, entry);
   if (status === "CALLED") emitQueueCalled(restaurantId, entry);
@@ -293,8 +294,8 @@ export async function updateQueueStatus(restaurantId, queueId, status) {
  * @returns {Promise<object|null>} Called guest entry
  */
 export async function callNextGuest(restaurantId) {
-  // Get first WAITING guest
-  const waiting = await db
+  // Get first WAITING guest using writeDb to avoid replication lag race conditions
+  const waiting = await writeDb
     .select()
     .from(guestQueue)
     .where(
@@ -329,7 +330,7 @@ export async function seatGuest(restaurantId, queueId, tableId = null) {
   // Optionally update table status to OCCUPIED
   let updatedTable = null;
   if (tableId && entry) {
-    const tableRows = await db
+    const tableRows = await writeDb
       .update(tables)
       .set({ currentStatus: "OCCUPIED", updatedAt: new Date() })
       .where(
@@ -444,6 +445,9 @@ export async function estimateWaitTime(restaurantId, position, partySize) {
  * @returns {Promise<object>} Queue statistics
  */
 export async function getQueueStats(restaurantId) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
   const stats = await db
     .select({
       totalWaiting: sql`count(*) filter (where ${guestQueue.status} = 'WAITING')`,
@@ -454,14 +458,16 @@ export async function getQueueStats(restaurantId) {
       oldestWaiting: sql`min(${guestQueue.entryTime}) filter (where ${guestQueue.status} = 'WAITING')`,
     })
     .from(guestQueue)
-    .where(eq(guestQueue.restaurantId, restaurantId));
+    .where(
+      and(
+        eq(guestQueue.restaurantId, restaurantId),
+        sql`${guestQueue.entryTime} >= ${today}`
+      )
+    );
 
   const result = stats[0];
 
   // Calculate average wait time from seated guests (today)
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
   const avgWaitResult = await db
     .select({
       avgWaitMinutes: sql`avg(extract(epoch from (${guestQueue.seatedTime} - ${guestQueue.entryTime})) / 60)`,
@@ -500,7 +506,20 @@ export async function getQueueHistory(restaurantId, options = {}) {
   } = options;
 
   const entries = await db
-    .select()
+    .select({
+      id: guestQueue.id,
+      restaurantId: guestQueue.restaurantId,
+      guestName: guestQueue.guestName,
+      partySize: guestQueue.partySize,
+      phoneNumber: guestQueue.phoneNumber,
+      status: guestQueue.status,
+      entryTime: guestQueue.entryTime,
+      calledTime: guestQueue.calledTime,
+      seatedTime: guestQueue.seatedTime,
+      cancelledTime: guestQueue.cancelledTime,
+      notes: guestQueue.notes,
+      totalCount: sql`count(*) OVER()`.as('totalCount'),
+    })
     .from(guestQueue)
     .where(
       and(
@@ -512,21 +531,11 @@ export async function getQueueHistory(restaurantId, options = {}) {
     .limit(limit)
     .offset(offset);
 
-  // Get total count
-  const countResult = await db
-    .select({ count: sql`count(*)` })
-    .from(guestQueue)
-    .where(
-      and(
-        eq(guestQueue.restaurantId, restaurantId),
-        inArray(guestQueue.status, status)
-      )
-    );
-
-  const totalCount = parseInt(countResult[0]?.count || 0);
+  const totalCount = entries.length > 0 ? parseInt(entries[0].totalCount || 0) : 0;
+  const rows = entries.map(({ totalCount, ...r }) => r);
 
   return {
-    entries,
+    entries: rows,
     pagination: {
       total: totalCount,
       limit,
@@ -543,11 +552,16 @@ export async function getQueueHistory(restaurantId, options = {}) {
  * @returns {Promise<Array>} Updated entries
  */
 export async function bulkUpdateQueue(restaurantId, updates) {
-  const results = await Promise.all(
-    updates.map(({ id, status }) =>
-      updateQueueStatus(restaurantId, id, status)
-    )
-  );
+  if (!updates || updates.length === 0) return [];
+  
+  // SCALE-1 FIX: Run all updates within a single transaction
+  const results = await writeDb.transaction(async (tx) => {
+    return Promise.all(
+      updates.map(({ id, status }) =>
+        updateQueueStatus(restaurantId, id, status, tx)
+      )
+    );
+  });
 
   const entries = results.filter(Boolean);
   if (entries.length > 0) {
@@ -566,7 +580,7 @@ export async function cleanupOldQueue(restaurantId, daysOld = 7) {
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - daysOld);
 
-  const result = await db
+  const result = await writeDb
     .delete(guestQueue)
     .where(
       and(

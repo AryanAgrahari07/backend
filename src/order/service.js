@@ -11,7 +11,8 @@ import {
   transactions,
   staff
 } from "../../shared/schema.js";
-import { db } from "../dbClient.js";
+import { createTransaction } from "../transaction/service.js"; // BUG-2: Static import
+import { db, readDb } from "../dbClient.js"; // PERF-4: Import readDb for read-only queries
 import {
   emitOrderCreated,
   emitOrderItemsAdded,
@@ -19,7 +20,8 @@ import {
   emitOrderUpdated,
 } from "../realtime/events.js";
 import { emitTableStatusChanged } from "../realtime/events.js";
-
+import { getRedisClient } from "../redis/client.js";
+import { cacheGetOrSetJson } from "../redis/cache.js";
 /**
  * Process order items with customization data
  * Fetches variant and modifier details, calculates prices including customizations
@@ -33,7 +35,9 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
 
   // Batch fetch base menu items
   const menuItemIds = Array.from(new Set(items.map((i) => i.menuItemId)));
-  const menuItemRows = await db
+  const dbToUse = arguments.length > 2 && arguments[2] ? arguments[2] : readDb; // BUG-1: Use readDb or tx
+
+  const menuItemRows = await dbToUse
     .select({ id: menuItems.id, name: menuItems.name, nameTranslations: menuItems.nameTranslations, price: menuItems.price })
     .from(menuItems)
     .where(and(eq(menuItems.restaurantId, restaurantId), inArray(menuItems.id, menuItemIds)));
@@ -43,7 +47,7 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
   // Batch fetch selected variants (variant price replaces base price)
   const variantIds = Array.from(new Set(items.map((i) => i.variantId).filter(Boolean)));
   const variantRows = variantIds.length
-    ? await db
+    ? await dbToUse
         .select({
           id: menuItemVariants.id,
           menuItemId: menuItemVariants.menuItemId,
@@ -63,7 +67,7 @@ async function processOrderItemsWithCustomization(restaurantId, items) {
   );
 
   const modifierRows = allModifierIds.length
-    ? await db
+    ? await dbToUse
         .select({
           id: modifiers.id,
           name: modifiers.name,
@@ -175,11 +179,6 @@ export async function updatePaymentStatus(restaurantId, orderId, paymentStatus, 
     // Add the outstanding amount to paid amount
     updateData.paid_amount = totalAmount.toFixed(2);  // ✅ This correctly sets to total
     updateData.closedAt = new Date();
-    
-    console.log("💳 Marking order as PAID");
-    console.log("Previous paid amount:", currentPaidAmount.toFixed(2));
-    console.log("Outstanding amount paid:", outstandingAmount.toFixed(2));
-    console.log("Total paid amount:", totalAmount.toFixed(2));
   }
 
   const rows = await db
@@ -210,8 +209,6 @@ export async function updatePaymentStatus(restaurantId, orderId, paymentStatus, 
 
       if (existingTransaction) {
         // ✅ UPDATE existing transaction instead of creating new one
-        console.log("💳 Transaction already exists, updating it...");
-        
         await db
           .update(transactions)
           .set({
@@ -224,13 +221,13 @@ export async function updatePaymentStatus(restaurantId, orderId, paymentStatus, 
             paidAt: new Date(), // Update payment time
           })
           .where(eq(transactions.id, existingTransaction.id));
-
-        console.log("✅ Transaction updated:", existingTransaction.id);
       } else {
-        // ✅ CREATE new transaction only if none exists
-        const billNumber = `INV-${Math.floor(1000 + Math.random() * 9000)}`;
-        
-        const { createTransaction } = await import("../transaction/service.js");
+        // ✅ CREATE new transaction only if none exists — use atomic DB counter for unique bill numbers
+        const counterResult = await db.execute(
+          sql`UPDATE restaurants SET invoice_counter = invoice_counter + 1 WHERE id = ${restaurantId} RETURNING invoice_counter`
+        );
+        const invoiceNum = counterResult.rows[0]?.invoice_counter ?? Math.floor(1000 + Math.random() * 9000);
+        const billNumber = `INV-${String(invoiceNum).padStart(6, '0')}`;
         
         try {
           await createTransaction(
@@ -245,8 +242,6 @@ export async function updatePaymentStatus(restaurantId, orderId, paymentStatus, 
               combinedTotal: parseFloat(updated.totalAmount),
             }
           );
-
-          console.log("✅ New transaction created");
         } catch (err) {
           console.error("Failed to create transaction:", err);
         }
@@ -341,94 +336,89 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
     waiveServiceCharge = false,
   } = data;
 
-  // ✅ FIX: Only reuse order if it's OPEN (is_closed = false)
-  // This prevents adding items to completed/closed orders
-  if (tableId && orderType === "DINE_IN") {
-    const existingRows = await db
-      .select()
-      .from(orders)
-      .where(
-        and(
-          eq(orders.restaurantId, restaurantId),
-          eq(orders.tableId, tableId),
-          eq(orders.orderType, "DINE_IN"),
-          eq(orders.isClosed, false), // ✅ CRITICAL: Only open orders
-          // Include orders in any active state OR partially paid
-          or(
-            inArray(orders.status, ['PENDING', 'PREPARING', 'READY', 'SERVED']),
-            eq(orders.paymentStatus, 'PARTIALLY_PAID')
-          )
-        ),
-      )
-      .orderBy(desc(orders.createdAt))
-      .limit(1);
+  return await db.transaction(async (tx) => {
+    // ✅ FIX: Only reuse order if it's OPEN (is_closed = false)
+    if (tableId && orderType === "DINE_IN") {
+      const existingRows = await tx
+        .select()
+        .from(orders)
+        .where(
+          and(
+            eq(orders.restaurantId, restaurantId),
+            eq(orders.tableId, tableId),
+            eq(orders.orderType, "DINE_IN"),
+            eq(orders.isClosed, false), // ✅ CRITICAL: Only open orders
+            // Include orders in any active state OR partially paid
+            or(
+              inArray(orders.status, ['PENDING', 'PREPARING', 'READY', 'SERVED']),
+              eq(orders.paymentStatus, 'PARTIALLY_PAID')
+            )
+          ),
+        )
+        .orderBy(desc(orders.createdAt))
+        .limit(1);
 
-    const existing = existingRows[0];
-    if (existing) {
-      console.log("🔄 Found OPEN order for table, adding items to it:", existing.id);
+      const existing = existingRows[0];
+      if (existing) {
 
-      // ✅ If caller provided a staff assignment (admin selected waiter),
-      // update the existing open order so it becomes assigned to that waiter.
-      // This is important for Waiter Terminal filtering/notifications.
-      const shouldUpdateAssignment = placedByStaffId && existing.placedByStaffId !== placedByStaffId;
+        const shouldUpdateAssignment = placedByStaffId && existing.placedByStaffId !== placedByStaffId;
 
-      // Optionally enrich guest info if provided
-      if (
-        (guestName && !existing.guestName) ||
-        (guestPhone && !existing.guestPhone) ||
-        notes ||
-        shouldUpdateAssignment
-      ) {
-        await db
-          .update(orders)
-          .set({
-            guestName: existing.guestName ?? (guestName || null),
-            guestPhone: existing.guestPhone ?? (guestPhone || null),
-            notes: notes ?? existing.notes,
-            placedByStaffId: shouldUpdateAssignment ? placedByStaffId : existing.placedByStaffId,
-            updatedAt: new Date(),
-          })
-          .where(eq(orders.id, existing.id));
+        // Optionally enrich guest info if provided
+        if (
+          (guestName && !existing.guestName) ||
+          (guestPhone && !existing.guestPhone) ||
+          notes ||
+          shouldUpdateAssignment
+        ) {
+          await tx
+            .update(orders)
+            .set({
+              guestName: existing.guestName ?? (guestName || null),
+              guestPhone: existing.guestPhone ?? (guestPhone || null),
+              notes: notes ?? existing.notes,
+              placedByStaffId: shouldUpdateAssignment ? placedByStaffId : existing.placedByStaffId,
+              updatedAt: new Date(),
+            })
+            .where(eq(orders.id, existing.id));
 
-        // Also mirror assignment onto the table if applicable
-        if (shouldUpdateAssignment) {
-          try {
-            await db
-              .update(tables)
-              .set({ assignedWaiterId: placedByStaffId, updatedAt: new Date() })
-              .where(and(eq(tables.restaurantId, restaurantId), eq(tables.id, tableId)));
-          } catch (err) {
-            console.error("Failed to update table assignment for existing order:", err);
+          // Also mirror assignment onto the table if applicable
+          if (shouldUpdateAssignment) {
+            try {
+              await tx
+                .update(tables)
+                .set({ assignedWaiterId: placedByStaffId, updatedAt: new Date() })
+                .where(and(eq(tables.restaurantId, restaurantId), eq(tables.id, tableId)));
+            } catch (err) {
+              console.error("Failed to update table assignment for existing order:", err);
+            }
           }
         }
+
+        // Add items to existing order (this will handle payment status properly)
+        const { order: updatedOrder } = await addOrderItems(
+          restaurantId,
+          existing.id,
+          items,
+          paymentMethod,
+          paymentStatus,
+          tx // BUG-6: passing tx is now acceptable because we updated addOrderItems signature
+        );
+
+        return await getOrder(restaurantId, existing.id);
+      } else {
+        // No open order found for table
       }
-
-      // Add items to existing order (this will handle payment status properly)
-      const { order: updatedOrder } = await addOrderItems(
-        restaurantId,
-        existing.id,
-        items,
-        paymentMethod,
-        paymentStatus,
-      );
-
-      console.log("✅ Items added to existing OPEN order. Payment status:", updatedOrder.paymentStatus);
-
-      // Return enriched order so UI has placedByStaff info.
-      return await getOrder(restaurantId, existing.id);
-    } else {
-      console.log("📝 No open order found for table, creating new order");
     }
-  }
 
   // Process items with customization
   const { processedItems, subtotal } = await processOrderItemsWithCustomization(
     restaurantId,
-    items
+    items,
+    tx // BUG-1: pass tx down
   );
 
   // Get restaurant tax rates
-  const restaurantRows = await db
+  const restaurantRows = await tx
     .select()
     .from(restaurants)
     .where(eq(restaurants.id, restaurantId))
@@ -446,9 +436,6 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
 
   const totalAmount = subtotal + gstAmount + serviceTaxAmount;
   
-  console.log("-----");
-  console.log("✅ Order placed by staff ID:", placedByStaffId);
-  
   const finalOrderStatus = "PENDING";
   const finalPaymentStatus = paymentStatus;
   
@@ -456,7 +443,7 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
   const paid_amount = paymentStatus === "PAID" ? totalAmount.toFixed(2) : "0";
 
   // Create order (defaults to OPEN - is_closed = false)
-  const orderRows = await db
+  const orderRows = await tx
     .insert(orders)
     .values({
       restaurantId,
@@ -500,7 +487,7 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
     customizationAmount: item.customizationAmount || "0",
   }));
 
-  const createdItems = await db
+  const createdItems = await tx
     .insert(orderItems)
     .values(orderItemsData)
     .returning();
@@ -512,7 +499,7 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
 
   // Update table status to OCCUPIED if tableId is provided and orderType is DINE_IN
   if (tableId && orderType === "DINE_IN") {
-    const tableRows = await db
+    const tableRows = await tx
       .update(tables)
       .set({
         currentStatus: "OCCUPIED",
@@ -533,9 +520,13 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
     }
   }
 
-  // If paid upfront, create transaction record
+  // If paid upfront, create transaction record using atomic DB-sequence invoice number
   if (paymentStatus === "PAID" && paymentMethod && paymentMethod !== "DUE") {
-    const billNumber = `INV-${Math.floor(1000 + Math.random() * 9000)}`;
+    const counterResult = await tx.execute(
+      sql`UPDATE restaurants SET invoice_counter = invoice_counter + 1 WHERE id = ${restaurantId} RETURNING invoice_counter`
+    );
+    const invoiceNum = counterResult.rows[0]?.invoice_counter ?? Math.floor(1000 + Math.random() * 9000);
+    const billNumber = `INV-${String(invoiceNum).padStart(6, '0')}`;
     const { createTransaction } = await import("../transaction/service.js");
     
     try {
@@ -547,16 +538,16 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
         combinedService: parseFloat(order.serviceTaxAmount),
         combinedTotal: parseFloat(order.totalAmount),
       });
-      console.log("💳 Transaction created for prepaid order");
     } catch (err) {
       console.error("Failed to create transaction for prepaid order:", err);
     }
   }
 
   emitOrderCreated(restaurantId, result);
-  console.log(result);
+  console.log({ event: 'order.created', orderId: result.id, restaurantId, totalAmount: result.totalAmount });
 
   return result;
+  }); // end db.transaction
 }
 
 /**
@@ -566,7 +557,8 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
  * @returns {Promise<object|null>} Order with items
  */
 export async function getOrder(restaurantId, orderId) {
-  const rows = await db
+  // PERF-4: Use readDb for SELECT — routes to read replica, frees write pool
+  const rows = await readDb
     .select({
       order: orders,
       placedByStaff: {
@@ -574,6 +566,32 @@ export async function getOrder(restaurantId, orderId) {
         fullName: staff.fullName,
         role: staff.role,
       },
+      items: sql`COALESCE((
+        SELECT json_agg(
+          json_build_object(
+            'id', i.id,
+            'orderId', i.order_id,
+            'menuItemId', i.menu_item_id,
+            'itemName', i.item_name,
+            'itemNameTranslations', i.item_name_translations,
+            'quantity', i.quantity,
+            'unitPrice', i.unit_price,
+            'totalPrice', i.total_price,
+            'notes', i.notes,
+            'status', i.status,
+            'selectedVariantId', i.selected_variant_id,
+            'variantName', i.variant_name,
+            'variantNameTranslations', i.variant_name_translations,
+            'variantPrice', i.variant_price,
+            'selectedModifiers', i.selected_modifiers,
+            'customizationAmount', i.customization_amount,
+            'createdAt', i.created_at,
+            'updatedAt', i.updated_at
+          )
+        )
+        FROM order_items i
+        WHERE i.order_id = ${orders.id}
+      ), '[]'::json)`,
     })
     .from(orders)
     .leftJoin(staff, eq(staff.id, orders.placedByStaffId))
@@ -586,14 +604,8 @@ export async function getOrder(restaurantId, orderId) {
   const order = row.order;
   const placedByStaff = row.placedByStaff?.id ? row.placedByStaff : null;
 
-  // Get order items with customization data
-  const items = await db
-    .select()
-    .from(orderItems)
-    .where(eq(orderItems.orderId, orderId));
-
-  // Parse selectedModifiers JSONB field for each item
-  const parsedItems = items.map(item => ({
+  // Parse modifiers and normalize the json mapping
+  const items = (row.items || []).map(item => ({
     ...item,
     selectedModifiers: item.selectedModifiers || [],
   }));
@@ -601,7 +613,7 @@ export async function getOrder(restaurantId, orderId) {
   return {
     ...order,
     paid_amount: order.paid_amount || order.paid_amount,
-    items: parsedItems,
+    items,
     placedByStaff,
   };
 }
@@ -632,13 +644,9 @@ export async function listCancelledOrdersSummary(restaurantId, filters = {}) {
   if (toDate) conditions.push(lte(orders.updatedAt, new Date(toDate)));
   if (placedByStaffId) conditions.push(eq(orders.placedByStaffId, placedByStaffId));
 
-  const countResult = await db
-    .select({ count: sql`count(*)` })
-    .from(orders)
-    .where(and(...conditions));
-  const total = parseInt(countResult[0]?.count || 0);
-
-  const rows = await db
+  // PERF-3: Single query using window function to avoid separate COUNT(*) round-trip
+  // PERF-4: Use readDb for SELECT — routes to read replica
+  const listResult = await readDb
     .select({
       id: orders.id,
       status: orders.status,
@@ -659,6 +667,7 @@ export async function listCancelledOrdersSummary(restaurantId, filters = {}) {
       updatedAt: orders.updatedAt,
       closedAt: orders.closedAt,
       isClosed: orders.isClosed,
+      totalCount: sql`count(*) OVER()`.as('totalCount'),
     })
     .from(orders)
     .where(and(...conditions))
@@ -666,23 +675,24 @@ export async function listCancelledOrdersSummary(restaurantId, filters = {}) {
     .limit(limit)
     .offset(offset);
 
+  const total = listResult.length > 0 ? parseInt(listResult[0].totalCount || 0) : 0;
+  const rows = listResult.map(({ totalCount, ...r }) => r);
+
   // Enrich table + staff with minimal extra queries
   const tableIds = Array.from(new Set(rows.map(r => r.tableId).filter(Boolean)));
   const staffIds = Array.from(new Set(rows.map(r => r.placedByStaffId).filter(Boolean)));
 
   let tableMap = new Map();
   if (tableIds.length) {
-    const tableRows = await db
+    const tableRows = await readDb
       .select({ id: tables.id, tableNumber: tables.tableNumber, floorSection: tables.floorSection })
       .from(tables)
       .where(inArray(tables.id, tableIds));
     tableMap = new Map(tableRows.map(t => [t.id, t]));
   }
 
-  let staffMap = new Map();
   if (staffIds.length) {
-    const { staff } = await import("../../shared/schema.js");
-    const staffRows = await db
+    const staffRows = await readDb
       .select({ id: staff.id, fullName: staff.fullName, role: staff.role })
       .from(staff)
       .where(inArray(staff.id, staffIds));
@@ -712,7 +722,7 @@ export async function listOrders(restaurantId, filters = {}) {
     tableId,
     fromDate,
     toDate,
-    limit = 50,
+    limit = 20,
     offset = 0,
     placedByStaffId,
     excludePaid = true, // Default behavior for live orders lists
@@ -763,26 +773,25 @@ export async function listOrders(restaurantId, filters = {}) {
     conditions.push(eq(orders.placedByStaffId, placedByStaffId));
   }
 
-  // Get total count for pagination
-  const countResult = await db
-    .select({ count: sql`count(*)` })
-    .from(orders)
-    .where(and(...conditions));
-
-  const total = parseInt(countResult[0]?.count || 0);
-
-  // Get paginated orders
-  const ordersList = await db
-    .select()
+  // Get paginated orders along with the total count in a single trip using Window Functions
+  // PERF-4: Use readDb for this expensive query — routes to read replica
+  const ordersListResult = await readDb
+    .select({
+      order: orders,
+      totalCount: sql`count(*) OVER()`.as('totalCount')
+    })
     .from(orders)
     .where(and(...conditions))
     .orderBy(desc(orders.createdAt))
     .limit(limit)
     .offset(offset);
 
-  if (ordersList.length === 0) {
-    return { orders: [], total };
+  if (ordersListResult.length === 0) {
+    return { orders: [], total: 0 };
   }
+
+  const total = parseInt(ordersListResult[0]?.totalCount || 0);
+  const ordersList = ordersListResult.map(r => r.order);
 
   // Batch fetch items, tables, and staff to avoid N+1 queries
   const orderIds = ordersList.map((o) => o.id);
@@ -790,21 +799,18 @@ export async function listOrders(restaurantId, filters = {}) {
   const staffIds = Array.from(new Set(ordersList.map((o) => o.placedByStaffId).filter(Boolean)));
 
   const [itemsRows, tableRows, staffRows] = await Promise.all([
-    db.select().from(orderItems).where(inArray(orderItems.orderId, orderIds)),
+    readDb.select().from(orderItems).where(inArray(orderItems.orderId, orderIds)),
     tableIds.length
-      ? db
+      ? readDb
           .select({ id: tables.id, tableNumber: tables.tableNumber, floorSection: tables.floorSection })
           .from(tables)
           .where(inArray(tables.id, tableIds))
       : Promise.resolve([]),
     staffIds.length
-      ? (async () => {
-          const { staff } = await import("../../shared/schema.js");
-          return db
-            .select({ id: staff.id, fullName: staff.fullName, role: staff.role })
-            .from(staff)
-            .where(inArray(staff.id, staffIds));
-        })()
+      ? readDb
+          .select({ id: staff.id, fullName: staff.fullName, role: staff.role })
+          .from(staff)
+          .where(inArray(staff.id, staffIds))
       : Promise.resolve([]),
   ]);
 
@@ -825,7 +831,7 @@ export async function listOrders(restaurantId, filters = {}) {
 
     return {
       ...order,
-      paid_amount: order.paid_amount || order.paid_amount || "0",
+      paid_amount: order.paid_amount || "0",
       items: itemsByOrderId.get(order.id) || [],
       table: tableInfo,
       placedByStaff: staffInfo,
@@ -1213,59 +1219,68 @@ export async function closeOrder(restaurantId, orderId) {
  * @returns {Promise<Array>} Active orders with items
  */
 export async function getKitchenOrders(restaurantId) {
-  const activeOrders = await db
-    .select()
-    .from(orders)
-    .where(
-      and(
-        eq(orders.restaurantId, restaurantId),
-        inArray(orders.status, ['PENDING', 'PREPARING', 'READY'])
+  const cacheKey = `kds:active:${restaurantId}`;
+  const redisClient = getRedisClient();
+  const ttlSeconds = 10;
+
+  const producer = async () => {
+    // BUG-1 FIX: Use readDb for all read queries — KDS is the most polled endpoint
+    const activeOrders = await readDb
+      .select()
+      .from(orders)
+      .where(
+        and(
+          eq(orders.restaurantId, restaurantId),
+          inArray(orders.status, ['PENDING', 'PREPARING', 'READY'])
+        )
       )
-    )
-    .orderBy(orders.createdAt);
+      .orderBy(orders.createdAt);
 
-  if (activeOrders.length === 0) return [];
+    if (activeOrders.length === 0) return [];
 
-  const orderIds = activeOrders.map((o) => o.id);
-  const tableIds = Array.from(new Set(activeOrders.map((o) => o.tableId).filter(Boolean)));
-  const staffIds = Array.from(new Set(activeOrders.map((o) => o.placedByStaffId).filter(Boolean)));
+    const orderIds = activeOrders.map((o) => o.id);
+    const tableIds = Array.from(new Set(activeOrders.map((o) => o.tableId).filter(Boolean)));
+    const staffIds = Array.from(new Set(activeOrders.map((o) => o.placedByStaffId).filter(Boolean)));
 
-  const [itemsRows, tableRows, staffRows] = await Promise.all([
-    db.select().from(orderItems).where(inArray(orderItems.orderId, orderIds)),
-    tableIds.length
-      ? db
-          .select({ id: tables.id, tableNumber: tables.tableNumber, floorSection: tables.floorSection })
-          .from(tables)
-          .where(inArray(tables.id, tableIds))
-      : Promise.resolve([]),
-    staffIds.length
-      ? (async () => {
-          const { staff } = await import("../../shared/schema.js");
-          return db
+    const [itemsRows, tableRows, staffRows] = await Promise.all([
+      readDb.select().from(orderItems).where(inArray(orderItems.orderId, orderIds)),
+      tableIds.length
+        ? readDb
+            .select({ id: tables.id, tableNumber: tables.tableNumber, floorSection: tables.floorSection })
+            .from(tables)
+            .where(inArray(tables.id, tableIds))
+        : Promise.resolve([]),
+      staffIds.length
+        ? readDb
             .select({ id: staff.id, fullName: staff.fullName, role: staff.role })
             .from(staff)
-            .where(inArray(staff.id, staffIds));
-        })()
-      : Promise.resolve([]),
-  ]);
+            .where(inArray(staff.id, staffIds))
+        : Promise.resolve([]),
+    ]);
 
-  const itemsByOrderId = new Map();
-  for (const item of itemsRows) {
-    const parsed = { ...item, selectedModifiers: item.selectedModifiers || [] };
-    const arr = itemsByOrderId.get(item.orderId);
-    if (arr) arr.push(parsed);
-    else itemsByOrderId.set(item.orderId, [parsed]);
+    const itemsByOrderId = new Map();
+    for (const item of itemsRows) {
+      const parsed = { ...item, selectedModifiers: item.selectedModifiers || [] };
+      const arr = itemsByOrderId.get(item.orderId);
+      if (arr) arr.push(parsed);
+      else itemsByOrderId.set(item.orderId, [parsed]);
+    }
+
+    const tableMap = new Map(tableRows.map((t) => [t.id, t]));
+    const staffMap = new Map(staffRows.map((s) => [s.id, s]));
+
+    return activeOrders.map((order) => ({
+      ...order,
+      items: itemsByOrderId.get(order.id) || [],
+      table: order.tableId ? tableMap.get(order.tableId) || null : null,
+      placedByStaff: order.placedByStaffId ? staffMap.get(order.placedByStaffId) || null : null,
+    }));
+  };
+
+  if (redisClient) {
+    return await cacheGetOrSetJson(redisClient, cacheKey, ttlSeconds, producer);
   }
-
-  const tableMap = new Map(tableRows.map((t) => [t.id, t]));
-  const staffMap = new Map(staffRows.map((s) => [s.id, s]));
-
-  return activeOrders.map((order) => ({
-    ...order,
-    items: itemsByOrderId.get(order.id) || [],
-    table: order.tableId ? tableMap.get(order.tableId) || null : null,
-    placedByStaff: order.placedByStaffId ? staffMap.get(order.placedByStaffId) || null : null,
-  }));
+  return await producer();
 }
 
 /**
@@ -1295,21 +1310,24 @@ export async function getOrderHistory(restaurantId, options = {}) {
     conditions.push(lte(orders.createdAt, new Date(toDate)));
   }
 
-  const ordersList = await db
-    .select()
+  const ordersWithCount = await db
+    .select({
+      ...orders,
+      total_count: sql`count(*) OVER()`.as('total_count'),
+    })
     .from(orders)
     .where(and(...conditions))
     .orderBy(desc(orders.createdAt))
     .limit(limit)
     .offset(offset);
 
-  // Get total count
-  const countResult = await db
-    .select({ count: sql`count(*)` })
-    .from(orders)
-    .where(and(...conditions));
-
-  const totalCount = parseInt(countResult[0]?.count || 0);
+  const totalCount = ordersWithCount.length > 0 ? Number(ordersWithCount[0].total_count) : 0;
+  
+  // Clean up the total_count property from the returned objects
+  const ordersList = ordersWithCount.map(o => {
+    const { total_count, ...orderData } = o;
+    return orderData;
+  });
 
   return {
     orders: ordersList,
@@ -1463,49 +1481,26 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
   let newPaymentStatus = order.paymentStatus;
   let newOrderStatus = order.status;
 
-  console.log("\n💰 Payment calculation for new items:");
-  console.log("Additional items subtotal:", additionalTotal.toFixed(2));
-  console.log("Additional items total (with tax):", additionalTotalWithTax.toFixed(2));
-  console.log("Payment method for new items:", paymentMethod);
-  console.log("Payment status for new items:", paymentStatus);
-
   // If new items are being PAID (not DUE), add to paid_amount
   if (paymentStatus === "PAID" && paymentMethod !== "DUE") {
     updatedPaidAmount += additionalTotalWithTax;
-    console.log("✅ New items PAID - adding to paid_amount:", additionalTotalWithTax.toFixed(2));
-    console.log("Updated paid_amount:", updatedPaidAmount.toFixed(2));
-  } else {
-    console.log("⏳ New items marked as DUE - not adding to paid_amount");
   }
 
   // Determine final payment status
   if (updatedPaidAmount >= newTotal - 0.01) { // Allow 1 cent tolerance for rounding
     newPaymentStatus = "PAID";
     updatedPaidAmount = newTotal; // Ensure exact match
-    console.log("✅ Order now FULLY PAID");
   } else if (updatedPaidAmount > 0) {
     newPaymentStatus = "PARTIALLY_PAID";
-    console.log("⚠️ Order now PARTIALLY PAID");
-    console.log("Total:", newTotal.toFixed(2));
-    console.log("Paid:", updatedPaidAmount.toFixed(2));
-    console.log("Outstanding:", (newTotal - updatedPaidAmount).toFixed(2));
   } else {
     newPaymentStatus = "DUE";
-    console.log("📋 Order remains DUE");
   }
 
   // Determine order status
   if (order.status === "SERVED" || order.status === "READY") {
     // Adding items to SERVED/READY order - send back to kitchen
     newOrderStatus = "PENDING";
-    console.log("🔄 Order status reset to PENDING (new items need preparation)");
   }
-
-  console.log("\n📊 Final order state:");
-  console.log("New total:", newTotal.toFixed(2));
-  console.log("Final paid_amount:", updatedPaidAmount.toFixed(2));
-  console.log("Final payment status:", newPaymentStatus);
-  console.log("Final order status:", newOrderStatus);
 
   // Update order totals and payment status
   await db
@@ -1525,8 +1520,6 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
 
   // ✅ If new items were PAID, create/update transaction
   if (paymentStatus === "PAID" && paymentMethod !== "DUE" && additionalTotalWithTax > 0) {
-    console.log("\n💳 Creating/updating transaction for paid items...");
-    
     // Check if transaction exists
     const existingTransactionRows = await db
       .select()
@@ -1538,7 +1531,6 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
 
     if (existingTransaction) {
       // Update existing transaction
-      console.log("Updating existing transaction:", existingTransaction.id);
       await db
         .update(transactions)
         .set({
@@ -1553,9 +1545,7 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
         .where(eq(transactions.id, existingTransaction.id));
     } else {
       // Create new transaction
-      console.log("Creating new transaction");
       const billNumber = `INV-${Math.floor(1000 + Math.random() * 9000)}`;
-      const { createTransaction } = await import("../transaction/service.js");
       
       try {
         await createTransaction(restaurantId, orderId, {
@@ -1613,6 +1603,11 @@ export async function removeOrderItem(restaurantId, orderId, orderItemId) {
   const itemToRemove = order.items.find(i => i.id === orderItemId);
   if (!itemToRemove) {
     throw new Error("Order item not found");
+  }
+
+  // REL-2 FIX: If this is the last item, cancel the entire order instead of leaving a zombie order
+  if (order.items.length === 1) {
+    return cancelOrderWithReason(restaurantId, orderId, "Last item removed", "SYSTEM");
   }
 
   // Remove the item

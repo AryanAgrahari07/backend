@@ -4,9 +4,11 @@ import { pool } from "../dbClient.js";
 
 export async function findUserByEmail(email) {
   const result = await pool.query(
-    `SELECT id, email, password_hash AS "passwordHash", full_name AS "fullName", role
-     FROM users
-     WHERE email = $1`,
+    `SELECT u.id, u.email, u.password_hash AS "passwordHash", u.full_name AS "fullName", u.role, r.id as "restaurantId"
+     FROM users u
+     LEFT JOIN restaurants r ON r.owner_id = u.id AND r.is_active = true
+     WHERE lower(u.email) = lower($1)
+     LIMIT 1`,
     [email],
   );
   return result.rows[0] || null;
@@ -14,9 +16,11 @@ export async function findUserByEmail(email) {
 
 export async function findUserById(id) {
   const result = await pool.query(
-    `SELECT id, email, password_hash AS "passwordHash", full_name AS "fullName", role
-     FROM users
-     WHERE id = $1`,
+    `SELECT u.id, u.email, u.password_hash AS "passwordHash", u.full_name AS "fullName", u.role, r.id as "restaurantId"
+     FROM users u
+     LEFT JOIN restaurants r ON r.owner_id = u.id AND r.is_active = true
+     WHERE u.id = $1
+     LIMIT 1`,
     [id],
   );
   return result.rows[0] || null;

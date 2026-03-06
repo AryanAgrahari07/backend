@@ -2,7 +2,7 @@ import express from "express";
 import { z } from "zod";
 import bcrypt from "bcryptjs";
 import { asyncHandler } from "../middleware/asyncHandler.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requireRole, requireRestaurantOwnership } from "../middleware/auth.js";
 import { requireActiveSubscription } from "../middleware/subscriptionBlocked.js";
 import { env } from "../config/env.js";
 import { createStaff, listStaff, updateStaff, deactivateStaff } from "./service.js";
@@ -62,6 +62,7 @@ export function registerStaffRoutes(app) {
   app.use(
     "/api/restaurants/:restaurantId/staff",
     requireAuth,
+    requireRestaurantOwnership, // H1: Tenant isolation — prevent cross-restaurant staff access
     requireActiveSubscription,
     requireRole("owner", "platform_admin", "admin"),
     router,
@@ -85,8 +86,8 @@ export function registerStaffRoutes(app) {
         return res.status(400).json({ message: "Invalid input", errors: parsed.error.errors });
       }
       const { fullName, phoneNumber, email, role, passcode } = parsed.data;
-      // Generate a default passcode if not provided
-      const finalPasscode = passcode || "1234"; // Default passcode
+      // SEC-2 FIX: Generate a random 6-digit passcode instead of a default "1234"
+      const finalPasscode = passcode || String(Math.floor(100000 + Math.random() * 900000));
       const passcodeHash = await bcrypt.hash(finalPasscode, env.bcryptRounds);
       const staff = await createStaff(restaurantId, {
         fullName,

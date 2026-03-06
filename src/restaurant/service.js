@@ -1,4 +1,4 @@
-import { pool } from "../dbClient.js";
+import { pool as writePool, readPool as pool } from "../dbClient.js";
 
 export async function listRestaurantsByOwner(ownerId) {
   const restaurants = await pool.query(
@@ -80,7 +80,7 @@ export async function createRestaurant(data) {
     settings,
   } = data;
 
-  const result = await pool.query(
+  const result = await writePool.query(
     `INSERT INTO restaurants
       (name, slug, type, currency, plan,
        address_line1, address_line2, city, state, postal_code, country,
@@ -127,7 +127,8 @@ function normalizeSlug(baseSlug) {
 }
 
 async function assertSlugAvailable(slug, excludeId) {
-  const res = await pool.query(
+  // Use specific write pool for unique checks to avoid replica lag false positives
+  const res = await writePool.query(
     `SELECT 1 FROM restaurants WHERE slug = $1 ${excludeId ? "AND id <> $2" : ""} LIMIT 1`,
     excludeId ? [slug, excludeId] : [slug],
   );
@@ -187,7 +188,7 @@ export async function updateRestaurant(id, data) {
 
   values.push(id);
 
-  const result = await pool.query(
+  const result = await writePool.query(
     `UPDATE restaurants
      SET ${fields.join(", ")}, updated_at = now()
      WHERE id = $${idx}
@@ -199,7 +200,7 @@ export async function updateRestaurant(id, data) {
 
 export async function deleteRestaurant(id) {
   // Soft delete via is_active=false
-  const result = await pool.query(
+  const result = await writePool.query(
     `UPDATE restaurants
      SET is_active = false, updated_at = now()
      WHERE id = $1

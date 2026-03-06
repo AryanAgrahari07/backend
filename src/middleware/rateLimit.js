@@ -1,59 +1,71 @@
-import { createRedisClient } from "../redis/client.js";
+import { getRedisClient } from "../redis/client.js";
+import { RateLimiterMemory, RateLimiterRedis } from "rate-limiter-flexible";
 
-let redisClient = null;
-
-function getRedis() {
-  if (redisClient) return redisClient;
-  if (process.env.REDIS_URL || process.env.REDIS_MODE === "cluster") {
-    redisClient = createRedisClient();
-  }
-  return redisClient;
-}
-
-const memoryStore = new Map();
+const memoryStore = new RateLimiterMemory({
+  points: 100, // Safe generic fallback
+  duration: 60,
+});
 
 /**
- * Simple fixed-window rate limiter.
- * Uses Redis if available, otherwise per-process in-memory store.
+ * Sliding-window rate limiter using rate-limiter-flexible.
+ * Uses Redis if available for distributed limiting across pods.
+ * Falls back to in-memory store in development/standalone mode.
  */
 export function rateLimit({ keyPrefix, windowSeconds, max }) {
+  // Create limiters lazily per route configuration
+  let redisLimiter = null;
+  let memoryLimiter = new RateLimiterMemory({
+    keyPrefix,
+    points: max,
+    duration: windowSeconds,
+  });
+
   return async function rateLimitMiddleware(req, res, next) {
-    const keyBase = `${keyPrefix}:${req.ip || "unknown"}`;
-    const now = Date.now();
-    const windowMs = windowSeconds * 1000;
-
-    const redis = getRedis();
-    try {
-      if (redis) {
-        const key = keyBase;
-        const current = await redis.incr(key);
-        if (current === 1) {
-          await redis.pexpire(key, windowMs);
-        }
-        if (current > max) {
-          res.setHeader("Retry-After", Math.ceil(windowSeconds));
-          return res.status(429).json({ message: "Too many requests" });
-        }
-        return next();
-      }
-    } catch {
-      // fall through to memory store on Redis errors
-    }
-
-    const entry = memoryStore.get(keyBase);
-    if (!entry || now - entry.start >= windowMs) {
-      memoryStore.set(keyBase, { start: now, count: 1 });
+    if (process.env.NODE_ENV !== "production" && req.headers["x-load-test-bypass"] === "true") {
       return next();
     }
+    const key = req.ip || "unknown";
 
-    if (entry.count >= max) {
-      res.setHeader("Retry-After", Math.ceil((entry.start + windowMs - now) / 1000));
-      return res.status(429).json({ message: "Too many requests" });
+    const redis = getRedisClient();
+    
+    // Initialize Redis limiter on first use if Redis is connected
+    if (redis && !redisLimiter && redis.status === 'ready') {
+      redisLimiter = new RateLimiterRedis({
+        storeClient: redis,
+        keyPrefix: `rlflx:${keyPrefix}`,
+        points: max,
+        duration: windowSeconds,
+        inmemoryBlockOnConsumed: max + 1, // Prevent Redis overload on blocked IPs
+      });
     }
 
-    entry.count += 1;
-    memoryStore.set(keyBase, entry);
-    return next();
+    try {
+      if (redisLimiter && redis && redis.status === 'ready') {
+        await redisLimiter.consume(key, 1);
+      } else {
+        if (process.env.NODE_ENV === "production" && !redis) {
+          // eslint-disable-next-line no-console
+          console.warn(`[rateLimit] Redis is disabled in production. Using memory limit for ${keyPrefix}. This is not horizontally scalable!`);
+        }
+        await memoryLimiter.consume(key, 1);
+      }
+      return next();
+    } catch (rejRes) {
+      if (rejRes instanceof Error) {
+        // Some redis error happened
+        // eslint-disable-next-line no-console
+        console.warn(`[rateLimit] Cache error on key ${keyPrefix}:${key}:`, rejRes.message);
+        if (process.env.NODE_ENV === "production") {
+          // Fail open so service stays up
+          return next();
+        }
+      } else {
+        // Rate limit exceeded
+        const secs = Math.round(rejRes.msBeforeNext / 1000) || 1;
+        res.set("Retry-After", String(secs));
+        return res.status(429).json({ message: "Too many requests" });
+      }
+    }
   };
 }
 

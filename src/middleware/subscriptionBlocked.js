@@ -1,5 +1,7 @@
 import { pool } from "../dbClient.js";
 import { asyncHandler } from "./asyncHandler.js";
+import { getRedisClient } from "../redis/client.js";
+import { cacheGetOrSetJson } from "../redis/cache.js";
 
 /**
  * Middleware to restrict access if the restaurant's subscription is expired.
@@ -10,19 +12,35 @@ export const requireActiveSubscription = asyncHandler(async (req, res, next) => 
     return res.status(401).json({ message: "Authentication required" });
   }
 
+  if (req.user.role === "platform_admin") {
+    return next();
+  }
+
   const targetRestaurantId = req.params.restaurantId || req.body.restaurantId || req.query.restaurantId || req.user.restaurantId || req.headers["x-restaurant-id"];
 
   if (!targetRestaurantId) {
     return res.status(400).json({ message: "Restaurant ID required for subscription check" });
   }
 
-  const result = await pool.query(
-    `SELECT plan, subscription_valid_until AS "subscriptionValidUntil", subscription_status AS "subscriptionStatus" 
-     FROM restaurants WHERE id = $1`,
-    [targetRestaurantId]
-  );
+  const redis = getRedisClient();
+  const cacheKey = `sub:status:${targetRestaurantId}`;
 
-  const restaurant = result.rows[0];
+  const fetchSubscriptionFromDb = async () => {
+    const result = await pool.query(
+      `SELECT plan, subscription_valid_until AS "subscriptionValidUntil", subscription_status AS "subscriptionStatus" 
+       FROM restaurants WHERE id = $1`,
+      [targetRestaurantId]
+    );
+    return result.rows[0] || null;
+  };
+
+  let restaurant = null;
+  if (redis) {
+    restaurant = await cacheGetOrSetJson(redis, cacheKey, 60, fetchSubscriptionFromDb);
+  } else {
+    restaurant = await fetchSubscriptionFromDb();
+  }
+
   if (!restaurant) {
     return res.status(404).json({ message: "Restaurant not found" });
   }

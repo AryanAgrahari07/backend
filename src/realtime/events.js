@@ -1,5 +1,12 @@
 import { emitRestaurantEvent } from "./emitter.js";
+import { getRedisClient } from "../redis/client.js";
 
+async function invalidateKitchenOrdersCache(restaurantId) {
+  const redis = getRedisClient();
+  if (redis && redis.status === "ready") {
+    await redis.del(`kds:active:${restaurantId}`).catch(() => {});
+  }
+}
 export const RealtimeEvents = {
   OrderCreated: "order.created",
   OrderUpdated: "order.updated",
@@ -21,18 +28,22 @@ export const RealtimeEvents = {
 };
 
 export function emitOrderCreated(restaurantId, order) {
+  invalidateKitchenOrdersCache(restaurantId);
   emitRestaurantEvent(restaurantId, RealtimeEvents.OrderCreated, { order });
 }
 
 export function emitOrderUpdated(restaurantId, order) {
+  invalidateKitchenOrdersCache(restaurantId);
   emitRestaurantEvent(restaurantId, RealtimeEvents.OrderUpdated, { order });
 }
 
 export function emitOrderStatusChanged(restaurantId, order) {
+  invalidateKitchenOrdersCache(restaurantId);
   emitRestaurantEvent(restaurantId, RealtimeEvents.OrderStatusChanged, { order });
 }
 
 export function emitOrderItemsAdded(restaurantId, orderId, newItems, order) {
+  invalidateKitchenOrdersCache(restaurantId);
   emitRestaurantEvent(restaurantId, RealtimeEvents.OrderItemsAdded, {
     orderId,
     newItems,

@@ -1,24 +1,12 @@
-import { createRedisClient } from "../redis/client.js";
-import { createPgPool } from "../db.js";
-import { env } from "../config/env.js";
-
-const pool = createPgPool(env.databaseUrl);
-
-let redis = null;
-function getRedis() {
-  if (redis) return redis;
-  if (process.env.REDIS_URL || process.env.REDIS_MODE === "cluster") {
-    redis = createRedisClient();
-  }
-  return redis;
-}
+import { getRedisClient } from "../redis/client.js";
+import { readPool as pool } from "../dbClient.js";
 
 /**
  * Invalidate menu cache for a restaurant
  * Can be called from anywhere that modifies menu data
  */
 export async function invalidateMenuCache(restaurantId) {
-  const redisClient = getRedis();
+  const redisClient = getRedisClient();
   if (!redisClient) {
     console.log('[Cache] Redis not configured, skipping cache invalidation');
     return;

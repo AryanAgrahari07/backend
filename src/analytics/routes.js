@@ -1,10 +1,12 @@
 import express from "express";
 import { asyncHandler } from "../middleware/asyncHandler.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requireRole, requireRestaurantOwnership } from "../middleware/auth.js";
 import { requireActiveSubscription } from "../middleware/subscriptionBlocked.js";
 import { getAnalyticsOverview, getAnalyticsSummary } from "./service.js";
+import { getRedisClient } from "../redis/client.js";
+import { cacheGetOrSetJson } from "../redis/cache.js";
 
-const router = express.Router();
+const router = express.Router({ mergeParams: true });
 
 const validTimeframes = ["day", "month", "quarter", "year"];
 
@@ -25,7 +27,15 @@ export function registerAnalyticsRoutes(app) {
         });
       }
 
-      const analytics = await getAnalyticsOverview(restaurantId, timeframe, { timeZone: timezone });
+      const redis = getRedisClient();
+      const cacheKey = `analytics:overview:${restaurantId}:${timeframe}`;
+      const ttl = timeframe === "day" ? 60 : 300; // 1 min for today, 5 min for historical
+      
+      const fetchAnalytics = () => getAnalyticsOverview(restaurantId, timeframe, { timeZone: timezone });
+      const analytics = redis 
+         ? await cacheGetOrSetJson(redis, cacheKey, ttl, fetchAnalytics)
+         : await fetchAnalytics();
+
       res.json({ analytics });
     })
   );
@@ -46,7 +56,15 @@ export function registerAnalyticsRoutes(app) {
         });
       }
 
-      const analytics = await getAnalyticsSummary(restaurantId, timeframe, { timeZone: timezone });
+      const redis = getRedisClient();
+      const cacheKey = `analytics:summary:${restaurantId}:${timeframe}`;
+      const ttl = timeframe === "day" ? 60 : 300; 
+      
+      const fetchAnalytics = () => getAnalyticsSummary(restaurantId, timeframe, { timeZone: timezone });
+      const analytics = redis 
+         ? await cacheGetOrSetJson(redis, cacheKey, ttl, fetchAnalytics)
+         : await fetchAnalytics();
+
       res.json({ analytics });
     })
   );

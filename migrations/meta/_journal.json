@@ -5,8 +5,36 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1772487133677,
-      "tag": "0000_solid_callisto",
+      "when": 1772555256478,
+      "tag": "0000_sudden_mole_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1772641756189,
+      "tag": "0001_adorable_skin",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1772652361380,
+      "tag": "0002_cold_dazzler",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1772653471637,
+      "tag": "0003_cooing_human_cannonball",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1772827304226,
+      "tag": "0004_left_callisto",
       "breakpoints": true
     }
   ]
