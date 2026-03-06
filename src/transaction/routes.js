@@ -8,7 +8,7 @@ import {
   createTransaction,
   listTransactions,
   getTransaction,
-  exportTransactionsCSV,
+  streamTransactionsCSV,
   getRecentTransactionsSummary,
 } from "./service.js";
 
@@ -114,46 +114,14 @@ export function registerTransactionRoutes(app) {
         });
       }
 
-      const rows = await exportTransactionsCSV(restaurantId, parsed.data);
-
-      // Generate CSV
-      const headers = [
-        'Bill Number',
-        'Date & Time',
-        'Table/Guest',
-        'Payment Method',
-        'Subtotal',
-        'GST',
-        'Service Tax',
-        'Discount',
-        'Grand Total'
-      ];
-
-      const csvRows = [
-        headers.join(','),
-        ...rows.map(row => {
-          const escapeCsv = (str) => String(str || '').replace(/"/g, '""');
-          return [
-            `"${escapeCsv(row.bill_number)}"`,
-            `"${new Date(row.paid_at).toLocaleString()}"`,
-            `"${escapeCsv(row.table_or_guest)}"`,
-            row.payment_method,
-            row.subtotal,
-            row.gst_amount,
-            row.service_tax_amount,
-            row.discount_amount,
-            row.grand_total,
-          ]
-        })
-      ];
-
-      const csv = csvRows.join('\n');
-
-      // Set headers for file download
+      // Set headers for file download and chunked transfer
       const filename = `transactions_${new Date().toISOString().split('T')[0]}.csv`;
       res.setHeader('Content-Type', 'text/csv');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      res.send(csv);
+      res.setHeader('Transfer-Encoding', 'chunked');
+
+      // The streamTransactionsCSV handles the looping through data and chunks directly to the response
+      await streamTransactionsCSV(restaurantId, { ...parsed.data, search: req.query.search }, res);
     })
   );
 

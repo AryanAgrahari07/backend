@@ -252,66 +252,165 @@ export async function listTransactions(restaurantId, filters = {}) {
 }
 
 /**
- * Export transactions as CSV data
+ * Stream transactions as CSV data
  * @param {string} restaurantId - Restaurant ID
  * @param {object} filters - Filter options
- * @returns {Promise<Array>} Transaction rows for CSV
+ * @param {import("express").Response} res - Express Response object for streaming
  */
-export async function exportTransactionsCSV(restaurantId, filters = {}) {
+export async function streamTransactionsCSV(restaurantId, filters, res) {
   const {
     fromDate,
     toDate,
     paymentMethod,
+    tableId,
+    search,
   } = filters;
 
-  let conditions = [eq(transactions.restaurantId, restaurantId)];
+  // We will stream data in chunks of 5000 to avoid memory issues for lakhs of rows
+  const limit = 5000;
+  let offset = 0;
+  let hasMore = true;
 
-  if (fromDate) {
-    conditions.push(gte(transactions.paidAt, new Date(fromDate)));
-  }
-  if (toDate) {
-    const endDate = new Date(toDate);
-    endDate.setDate(endDate.getDate() + 1);
-    conditions.push(lte(transactions.paidAt, endDate));
-  }
-  if (paymentMethod) {
-    conditions.push(eq(transactions.paymentMethod, paymentMethod));
+  // Import stringify dynamically to keep dependencies clean at top level
+  const { stringify } = await import("csv-stringify/sync");
+
+  // Define headers for the CSV
+  const headers = [
+    'Bill Number',
+    'Date & Time',
+    'Table/Guest',
+    'Payment Method',
+    'Subtotal',
+    'CGST',
+    'SGST',
+    'Service Charge',
+    'Discount',
+    'Round Off',
+    'Grand Total',
+    'Cashier',
+  ];
+
+  // Write header to response stream
+  res.write(stringify([headers]));
+
+  while (hasMore) {
+    let conditions = [eq(transactions.restaurantId, restaurantId)];
+
+    if (fromDate) {
+      conditions.push(gte(transactions.paidAt, new Date(fromDate)));
+    }
+    if (toDate) {
+      const endDate = new Date(toDate);
+      endDate.setDate(endDate.getDate() + 1);
+      conditions.push(lte(transactions.paidAt, endDate));
+    }
+    if (paymentMethod) {
+      conditions.push(eq(transactions.paymentMethod, paymentMethod));
+    }
+    if (tableId) {
+       // Requires joining orders anyway below, so we can filter by tableId on the join later if needed.
+       // For now, this is kept simpler.
+    }
+
+    let baseQuery = db
+      .select({
+        billNumber: transactions.billNumber,
+        paidAt: transactions.paidAt,
+        paymentMethod: transactions.paymentMethod,
+        subtotal: transactions.subtotal,
+        gstAmount: transactions.gstAmount,
+        serviceTaxAmount: transactions.serviceTaxAmount,
+        discountAmount: transactions.discountAmount,
+        grandTotal: transactions.grandTotal,
+        taxRateGst: transactions.taxRateGst,
+        tableNumber: tables.tableNumber,
+        guestName: orders.guestName,
+        staffName: sql`${staff.fullName}`,
+      })
+      .from(transactions)
+      .leftJoin(orders, eq(transactions.orderId, orders.id))
+      .leftJoin(tables, eq(orders.tableId, tables.id))
+      .leftJoin(staff, eq(orders.placedByStaffId, staff.id));
+
+    // Apply conditions
+    let query = baseQuery.where(and(...conditions));
+    
+    // Apply search if needed (same logic as listTransactions)
+    if (search && search.trim()) {
+      const searchTerm = `%${search.trim()}%`;
+      const searchConditions = [
+        ...conditions,
+        or(
+          ilike(transactions.billNumber, searchTerm),
+          sql`CAST(${tables.tableNumber} AS TEXT) ILIKE ${searchTerm}`,
+          ilike(orders.guestName, searchTerm)
+        )
+      ];
+      query = baseQuery.where(and(...searchConditions));
+    }
+
+    // Fetch chunk
+    const chunk = await query
+      .orderBy(desc(transactions.paidAt))
+      .limit(limit)
+      .offset(offset);
+
+    if (chunk.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    // Format chunk rows
+    const csvRows = chunk.map((row) => {
+      let cgst = 0;
+      let sgst = 0;
+      const gstAmt = parseFloat(row.gstAmount || "0");
+      
+      if (gstAmt > 0) {
+          cgst = gstAmt / 2;
+          sgst = gstAmt / 2;
+      }
+
+      // We explicitly calculate round off based on difference between sum and grand total in typical environments, 
+      // but for standard simplified CSV export, round off might be baked in. 
+      // For now we calculate implied round off if needed or leave 0 based on DB.
+      const sub = parseFloat(row.subtotal || "0");
+      const srv = parseFloat(row.serviceTaxAmount || "0");
+      const disc = Math.abs(parseFloat(row.discountAmount || "0"));
+      const gt = parseFloat(row.grandTotal || "0");
+      
+      const expectedTotal = sub + gstAmt + srv - disc;
+      const roundOff = gt - expectedTotal;
+
+      return [
+        row.billNumber,
+        new Date(row.paidAt).toLocaleString('en-IN'),
+        row.tableNumber ? `Table ${row.tableNumber}` : (row.guestName || 'N/A'),
+        row.paymentMethod,
+        sub.toFixed(2),
+        cgst.toFixed(2),
+        sgst.toFixed(2),
+        srv.toFixed(2),
+        disc.toFixed(2),
+        Math.abs(roundOff) > 0.01 ? roundOff.toFixed(2) : "0.00",
+        gt.toFixed(2),
+        row.staffName || 'System',
+      ];
+    });
+
+    // Write formatted chunk to response stream
+    res.write(stringify(csvRows));
+    
+    offset += limit;
+    
+    // If we fetched exactly the limit, there might be more. Otherwise we're done.
+    if (chunk.length < limit) {
+        hasMore = false;
+    }
   }
 
-  // OPTIMIZATION: Only select fields needed for CSV
-  const transactionsList = await db
-    .select({
-      billNumber: transactions.billNumber,
-      paidAt: transactions.paidAt,
-      paymentMethod: transactions.paymentMethod,
-      subtotal: transactions.subtotal,
-      gstAmount: transactions.gstAmount,
-      serviceTaxAmount: transactions.serviceTaxAmount,
-      discountAmount: transactions.discountAmount,
-      grandTotal: transactions.grandTotal,
-      tableNumber: tables.tableNumber,
-      guestName: orders.guestName,
-    })
-    .from(transactions)
-    .leftJoin(orders, eq(transactions.orderId, orders.id))
-    .leftJoin(tables, eq(orders.tableId, tables.id))
-    .where(and(...conditions))
-    .orderBy(desc(transactions.paidAt));
-
-  // Transform to CSV-friendly format
-  return transactionsList.map((row) => ({
-    bill_number: row.billNumber,
-    paid_at: row.paidAt,
-    table_or_guest: row.tableNumber 
-      ? `Table ${row.tableNumber}` 
-      : row.guestName || 'N/A',
-    payment_method: row.paymentMethod,
-    subtotal: row.subtotal,
-    gst_amount: row.gstAmount,
-    service_tax_amount: row.serviceTaxAmount,
-    discount_amount: row.discountAmount,
-    grand_total: row.grandTotal,
-  }));
+  // End the stream
+  res.end();
 }
 
 /**

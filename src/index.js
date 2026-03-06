@@ -89,13 +89,14 @@ app.use(compression());
 app.use("/api", rateLimit({ keyPrefix: "global", windowSeconds: 60, max: 300 }));
 
 // CORS Configuration
-const allowedOrigins = env.corsOrigin ? env.corsOrigin.split(',') : [];
+const allowedOrigins = env.corsOrigin ? env.corsOrigin.split(',').map(o => o.trim()) : [];
 
 const corsOptions = {
   origin: function (origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
+      logger.warn(`CORS blocked request from origin: ${origin}`);
       callback(new Error('Not allowed by CORS'));
     }
   },
