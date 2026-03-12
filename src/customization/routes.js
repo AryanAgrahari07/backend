@@ -29,10 +29,9 @@ const router = express.Router();
 // VARIANTS ROUTES
 // ============================================
 
-// Validation schemas - updated to accept total price
 const variantSchema = z.object({
   variantName: z.string().min(1).max(100),
-  price: z.number().positive(), // Total price of the variant
+  price: z.number().min(0), // Total price of the variant
   isDefault: z.boolean().optional(),
   sortOrder: z.number().int().optional(),
 });

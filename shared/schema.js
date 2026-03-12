@@ -127,6 +127,9 @@ export const restaurants = pgTable("restaurants", {
   settings: jsonb("settings"),
   plan: varchar("plan", { length: 50 }).default("STARTER"),
 
+  // Per-restaurant order counter — incremented by DB trigger whenever a new order is inserted
+  orderCounter: integer("order_counter").notNull().default(0),
+
   isActive: boolean("is_active").notNull().default(true),
 
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
@@ -230,6 +233,26 @@ export const menuItems = pgTable("menu_items", {
 //
 // MENU VARIANTS
 //
+
+//
+// MENU SUGGESTIONS
+//
+export const menuSuggestions = pgTable("menu_suggestions", {
+    id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+    name: varchar("name", { length: 200 }).notNull(),
+    description: text("description"),
+    price: numeric("price", { precision: 10, scale: 2 }).notNull(),
+    imageUrl: text("image_url"),
+    category: varchar("category", { length: 150 }),
+    dietaryTags: varchar("dietary_tags", { length: 50 }).array(), // Veg, Non-Veg
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+}, (table) => {
+    return {
+        nameSearchIdx: index("menu_suggestions_name_search_idx").using("gin", sql`to_tsvector('english', ${table.name})`),
+        categoryIdx: index("menu_suggestions_category_idx").on(table.category),
+    };
+});
 
 export const menuItemVariants = pgTable("menu_item_variants", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
@@ -481,10 +504,16 @@ export const orders = pgTable("orders", {
 
   notes: text("notes"),
   isClosed: boolean("is_closed").notNull().default(false),
+
+  // Human-readable serial number per restaurant. Assigned automatically by DB trigger on INSERT.
+  // Display only — UUID `id` stays as the primary key for all API routes.
+  orderNumber: integer("order_number"),
+
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
   closedAt: timestamp("closed_at", { withTimezone: true }),
 }, (table) => ({
+  restaurantOrderNumberIdx: index("orders_restaurant_order_number_idx").on(table.restaurantId, table.orderNumber),
   restaurantStatusDateIdx: index("orders_restaurant_status_date_idx").on(table.restaurantId, table.status, table.createdAt),
   restaurantTableIdx: index("orders_restaurant_table_idx").on(table.restaurantId, table.tableId),
 }));
@@ -538,9 +567,12 @@ export const orderItems = pgTable("order_items", {
     scale: 2,
   }).default("0"),
 
+  kotNumber: integer("kot_number"),
+
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
 }, (table) => ({
   orderRestaurantIdx: index("order_items_order_restaurant_idx").on(table.orderId, table.restaurantId),
+  restaurantKotNumberIdx: index("order_items_restaurant_kot_idx").on(table.restaurantId, table.kotNumber),
 }));
 
 
@@ -640,6 +672,11 @@ export const guestQueue = pgTable("guest_queue", {
   cancelledTime: timestamp("cancelled_time", { withTimezone: true }),
 
   notes: text("notes"),
+
+  assignedTableId: varchar("assigned_table_id").references(
+    () => tables.id,
+    { onDelete: "set null" }
+  ),
 }, (table) => ({
   restaurantStatusTimeIdx: index("guest_queue_restaurant_status_time_idx").on(table.restaurantId, table.status, table.entryTime),
 }));

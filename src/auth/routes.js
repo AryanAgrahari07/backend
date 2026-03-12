@@ -112,7 +112,7 @@ export function registerAuthRoutes(app) {
 
       await persistRefreshToken({
         subjectId: user.id,
-        subjectType: "user",
+        subjectType: user.isStaff ? "staff" : "user",
         refreshToken,
         userAgent: req.headers["user-agent"],
         ip: req.ip,
@@ -128,6 +128,7 @@ export function registerAuthRoutes(app) {
           email: user.email,
           fullName: user.fullName,
           role: user.role,
+          ...(user.isStaff ? { isStaff: true, staffId: user.id, restaurantId: user.restaurantId } : {})
         },
         token: accessToken,
         ...(includeRefreshInBody ? { refreshToken } : {}),
@@ -154,13 +155,6 @@ router.post(
       })
       .refine((v) => !!(v.staffCode || v.staffId || v.email), {
         message: "staffCode, staffId, or email is required",
-      })
-      // SEC-2: Enforce restaurantId for code/id-based logins
-      .refine((v) => !(v.staffCode && !v.restaurantId), {
-        message: "restaurantId is required when using staffCode",
-      })
-      .refine((v) => !(v.staffId && !v.restaurantId), {
-        message: "restaurantId is required when using staffId",
       });
 
     const parsed = schema.safeParse(req.body || {});
@@ -171,38 +165,22 @@ router.post(
     const { staffCode, staffId, email, restaurantId, passcode } = parsed.data;
 
     const result = staffCode
-      ? restaurantId
+      ? await pool.query(
+          `SELECT id, staff_code AS "staffCode", restaurant_id AS "restaurantId", full_name AS "fullName", email, role, passcode_hash AS "passcodeHash", is_active AS "isActive"
+           FROM staff
+           WHERE staff_code = $1
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [staffCode],
+        )
+      : staffId
         ? await pool.query(
             `SELECT id, staff_code AS "staffCode", restaurant_id AS "restaurantId", full_name AS "fullName", email, role, passcode_hash AS "passcodeHash", is_active AS "isActive"
              FROM staff
-             WHERE staff_code = $1 AND restaurant_id = $2
+             WHERE id = $1
              LIMIT 1`,
-            [staffCode, restaurantId],
+            [staffId],
           )
-        : await pool.query(
-            `SELECT id, staff_code AS "staffCode", restaurant_id AS "restaurantId", full_name AS "fullName", email, role, passcode_hash AS "passcodeHash", is_active AS "isActive"
-             FROM staff
-             WHERE staff_code = $1
-             ORDER BY created_at DESC
-             LIMIT 1`,
-            [staffCode],
-          )
-      : staffId
-        ? restaurantId
-          ? await pool.query(
-              `SELECT id, staff_code AS "staffCode", restaurant_id AS "restaurantId", full_name AS "fullName", email, role, passcode_hash AS "passcodeHash", is_active AS "isActive"
-               FROM staff
-               WHERE id = $1 AND restaurant_id = $2
-               LIMIT 1`,
-              [staffId, restaurantId],
-            )
-          : await pool.query(
-              `SELECT id, staff_code AS "staffCode", restaurant_id AS "restaurantId", full_name AS "fullName", email, role, passcode_hash AS "passcodeHash", is_active AS "isActive"
-               FROM staff
-               WHERE id = $1
-               LIMIT 1`,
-              [staffId],
-            )
         : await pool.query(
             `SELECT id, staff_code AS "staffCode", restaurant_id AS "restaurantId", full_name AS "fullName", email, role, passcode_hash AS "passcodeHash", is_active AS "isActive"
              FROM staff

@@ -63,7 +63,8 @@ export async function getRestaurantBySlug(slug) {
             country,
             email,
             phone_number AS "phoneNumber",
-            google_maps_link AS "googleMapsLink"
+            google_maps_link AS "googleMapsLink",
+            settings
      FROM restaurants
      WHERE slug = $1 AND is_active = true`,
     [slug],
@@ -394,5 +395,50 @@ export async function updateMenuItemImage(restaurantId, itemId, imageUrl) {
   );
   return result.rows[0] || null;
 }
+export async function getMenuSuggestions(query = '', page = 1, limit = 20) {
+  const offset = (page - 1) * limit;
+  let result;
+  let countResult;
 
+  if (query) {
+    // Full-text search on name
+    const tsQuery = query.trim().split(/\s+/).join(':* & ') + ':*';
+    result = await pool.query(
+      `SELECT id, name, description, price, image_url AS "imageUrl", category, dietary_tags AS "dietaryTags"
+       FROM menu_suggestions
+       WHERE to_tsvector('english', name) @@ to_tsquery('english', $1)
+       ORDER BY name
+       LIMIT $2 OFFSET $3`,
+      [tsQuery, limit, offset]
+    );
+    countResult = await pool.query(
+      `SELECT count(*)
+       FROM menu_suggestions
+       WHERE to_tsvector('english', name) @@ to_tsquery('english', $1)`,
+      [tsQuery]
+    );
+  } else {
+    // No search query, return all
+    result = await pool.query(
+      `SELECT id, name, description, price, image_url AS "imageUrl", category, dietary_tags AS "dietaryTags"
+       FROM menu_suggestions
+       ORDER BY name
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    countResult = await pool.query(`SELECT count(*) FROM menu_suggestions`);
+  }
 
+  const total = parseInt(countResult.rows[0].count, 10);
+  return {
+    items: result.rows,
+    pagination: {
+      total,
+      limit,
+      offset,
+      hasMore: offset + result.rows.length < total,
+      currentPage: page,
+      totalPages: Math.ceil(total / limit)
+    }
+  };
+}

@@ -12,6 +12,7 @@ import {
   deleteMenuItem,
   setItemAvailability,
   updateMenuItemImage,
+  getMenuSuggestions,
 } from "./service.js";
 import { env } from "../config/env.js";
 import { asyncHandler } from "../middleware/asyncHandler.js";
@@ -24,7 +25,7 @@ import { rateLimit } from "../middleware/rateLimit.js";
 import { getMenuForRestaurantWithCustomizations } from "../customization/service.js";
 import { pool } from "../dbClient.js";
 
-async function invalidateMenuCache(restaurantId) {
+export async function invalidateMenuCache(restaurantId) {
   const redis = getRedisClient();
   if (!redis || redis.status !== "ready") return;
   try {
@@ -98,6 +99,23 @@ export function registerMenuRoutes(app) {
       res.setHeader("Vary", "Accept-Encoding");
       return res.json(data);
     }),
+  );
+
+  // Protected: menu suggestions
+  router.get(
+    "/suggestions",
+    requireAuth,
+    requireActiveSubscription,
+    requireRole("owner", "admin", "platform_admin"),
+    rateLimit({ keyPrefix: "menu:suggestions", windowSeconds: 60, max: 200 }),
+    asyncHandler(async (req, res) => {
+      const query = req.query.q || "";
+      const page = parseInt(req.query.page, 10) || 1;
+      const limit = parseInt(req.query.limit, 10) || 20;
+      
+      const suggestions = await getMenuSuggestions(query, page, limit);
+      res.json(suggestions);
+    })
   );
 
   // Protected: category CRUD

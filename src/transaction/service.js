@@ -8,9 +8,10 @@ import { emitTableStatusChanged } from "../realtime/events.js";
  * @param {string} restaurantId - Restaurant ID
  * @param {string} orderId - Order ID
  * @param {object} data - Transaction data
+ * @param {object} [dbToUse=db] - Optional database connection/transaction object
  * @returns {Promise<object>} Created transaction
  */
-export async function createTransaction(restaurantId, orderId, data) {
+export async function createTransaction(restaurantId, orderId, data, dbToUse = db) {
   const {
     billNumber,
     paymentMethod,
@@ -21,7 +22,7 @@ export async function createTransaction(restaurantId, orderId, data) {
     combinedTotal,
   } = data;
 
-  const orderRows = await db
+  const orderRows = await dbToUse
     .select()
     .from(orders)
     .where(
@@ -43,14 +44,14 @@ export async function createTransaction(restaurantId, orderId, data) {
   const total = combinedTotal !== undefined ? combinedTotal : order.totalAmount;
 
   // Snapshot the tax rates used at the time of payment so receipts remain historical
-  const restaurantRows = await db
+  const restaurantRows = await dbToUse
     .select({ taxRateGst: restaurants.taxRateGst, taxRateService: restaurants.taxRateService })
     .from(restaurants)
     .where(eq(restaurants.id, restaurantId))
     .limit(1);
   const restaurant = restaurantRows[0];
 
-  const transactionRows = await db
+  const transactionRows = await dbToUse
     .insert(transactions)
     .values({
       restaurantId,
@@ -74,7 +75,7 @@ export async function createTransaction(restaurantId, orderId, data) {
   const transaction = transactionRows[0];
 
   if (order.tableId && order.orderType === "DINE_IN") {
-    const activeOrdersForTable = await db
+    const activeOrdersForTable = await dbToUse
       .select()
       .from(orders)
       .where(
@@ -88,7 +89,7 @@ export async function createTransaction(restaurantId, orderId, data) {
       .limit(1);
 
     if (activeOrdersForTable.length === 0) {
-      const tableRows = await db
+      const tableRows = await dbToUse
         .update(tables)
         .set({
           currentStatus: "AVAILABLE",
@@ -123,6 +124,7 @@ export async function listTransactions(restaurantId, filters = {}) {
     fromDate,
     toDate,
     paymentMethod,
+    orderType,
     search,
     limit = 20,
     offset = 0,
@@ -143,12 +145,18 @@ export async function listTransactions(restaurantId, filters = {}) {
   if (paymentMethod) {
     conditions.push(eq(transactions.paymentMethod, paymentMethod));
   }
+  if (orderType) {
+    // Note: since orderType is on orders table, this condition will be processed
+    // after the join in the query
+    conditions.push(eq(orders.orderType, orderType));
+  }
 
   // OPTIMIZATION: Select only necessary fields for list view
   let baseQuery = db
     .select({
       // Transaction essentials
       id: transactions.id,
+      // Transaction details
       billNumber: transactions.billNumber,
       paidAt: transactions.paidAt,
       paymentMethod: transactions.paymentMethod,
@@ -156,10 +164,14 @@ export async function listTransactions(restaurantId, filters = {}) {
       subtotal: transactions.subtotal,
       gstAmount: transactions.gstAmount,
       serviceTaxAmount: transactions.serviceTaxAmount,
+      discountAmount: transactions.discountAmount,
+      taxRateGst: transactions.taxRateGst,
+      taxRateService: transactions.taxRateService,
       
-      // Minimal order info
+      // Order info
       orderId: orders.id,
       orderType: orders.orderType,
+      status: orders.status,
       guestName: orders.guestName,
       
       // Minimal table info (only what's displayed)
@@ -228,9 +240,13 @@ export async function listTransactions(restaurantId, filters = {}) {
     subtotal: row.subtotal,
     gstAmount: row.gstAmount,
     serviceTaxAmount: row.serviceTaxAmount,
+    discountAmount: row.discountAmount,
+    taxRateGst: row.taxRateGst,
+    taxRateService: row.taxRateService,
     order: row.orderId ? {
       id: row.orderId,
       orderType: row.orderType,
+      status: row.status,
       guestName: row.guestName,
       table: row.tableNumber ? {
         tableNumber: row.tableNumber,
@@ -251,6 +267,11 @@ export async function listTransactions(restaurantId, filters = {}) {
   };
 }
 
+/** Maximum number of rows the CSV export will ever produce.
+ * Prevents runaway queries / OOM on large date ranges.
+ */
+const MAX_CSV_ROWS = 5_000;
+
 /**
  * Stream transactions as CSV data
  * @param {string} restaurantId - Restaurant ID
@@ -266,9 +287,10 @@ export async function streamTransactionsCSV(restaurantId, filters, res) {
     search,
   } = filters;
 
-  // We will stream data in chunks of 5000 to avoid memory issues for lakhs of rows
-  const limit = 5000;
+  // Chunk size — fetch this many rows per DB round-trip
+  const CHUNK_SIZE = 1000;
   let offset = 0;
+  let totalFetched = 0;
   let hasMore = true;
 
   // Import stringify dynamically to keep dependencies clean at top level
@@ -349,10 +371,18 @@ export async function streamTransactionsCSV(restaurantId, filters, res) {
       query = baseQuery.where(and(...searchConditions));
     }
 
+    // How many rows can we still safely fetch?
+    const remaining = MAX_CSV_ROWS - totalFetched;
+    if (remaining <= 0) {
+      hasMore = false;
+      break;
+    }
+    const fetchLimit = Math.min(CHUNK_SIZE, remaining);
+
     // Fetch chunk
     const chunk = await query
       .orderBy(desc(transactions.paidAt))
-      .limit(limit)
+      .limit(fetchLimit)
       .offset(offset);
 
     if (chunk.length === 0) {
@@ -371,9 +401,6 @@ export async function streamTransactionsCSV(restaurantId, filters, res) {
           sgst = gstAmt / 2;
       }
 
-      // We explicitly calculate round off based on difference between sum and grand total in typical environments, 
-      // but for standard simplified CSV export, round off might be baked in. 
-      // For now we calculate implied round off if needed or leave 0 based on DB.
       const sub = parseFloat(row.subtotal || "0");
       const srv = parseFloat(row.serviceTaxAmount || "0");
       const disc = Math.abs(parseFloat(row.discountAmount || "0"));
@@ -401,12 +428,21 @@ export async function streamTransactionsCSV(restaurantId, filters, res) {
     // Write formatted chunk to response stream
     res.write(stringify(csvRows));
     
-    offset += limit;
+    totalFetched += chunk.length;
+    offset += chunk.length;
     
-    // If we fetched exactly the limit, there might be more. Otherwise we're done.
-    if (chunk.length < limit) {
-        hasMore = false;
+    // Stop if we've hit the hard cap or got fewer rows than requested
+    if (totalFetched >= MAX_CSV_ROWS || chunk.length < fetchLimit) {
+      hasMore = false;
     }
+  }
+
+  // Append a note if the export was truncated
+  if (totalFetched >= MAX_CSV_ROWS) {
+    res.write(stringify([[
+      `NOTE: Export limited to ${MAX_CSV_ROWS.toLocaleString()} rows. Use a narrower date range to get all records.`,
+      '', '', '', '', '', '', '', '', '', '', ''
+    ]]));
   }
 
   // End the stream

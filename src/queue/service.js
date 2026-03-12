@@ -146,23 +146,38 @@ export async function getQueueEntry(restaurantId, queueId) {
  * @returns {Promise<object|null>} Most recent active queue entry
  */
 export async function getQueueEntryByPhone(restaurantId, phoneNumber) {
+  // We want to return the entry and possibly its assigned table if SEATED
   const rows = await db
-    .select()
+    .select({
+      entry: guestQueue,
+      table: tables, // will be null if no match
+    })
     .from(guestQueue)
+    .leftJoin(tables, eq(guestQueue.assignedTableId, tables.id))
     .where(
       and(
         eq(guestQueue.restaurantId, restaurantId),
         eq(guestQueue.phoneNumber, phoneNumber),
-        inArray(guestQueue.status, ["WAITING", "CALLED"])
+        // Waitlist users might be SEATED right now - they need to see their table.
+        inArray(guestQueue.status, ["WAITING", "CALLED", "SEATED"])
       )
     )
     .orderBy(desc(guestQueue.entryTime))
     .limit(1);
 
-  const entry = rows[0];
-  if (!entry) return null;
+  if (!rows.length) return null;
 
-  return hydrateQueueEntry(restaurantId, entry);
+  const { entry, table } = rows[0];
+
+  // If the guest is already seated, they might not need wait time calculation,
+  // but we still want to enrich it to keep the return type consistent.
+  const hydrated = await hydrateQueueEntry(restaurantId, entry);
+
+  if (table) {
+    hydrated.table = table;
+  }
+
+  return hydrated;
 }
 
 /**
@@ -249,10 +264,11 @@ export async function getActiveQueue(restaurantId) {
  * @param {string} queueId - Queue entry ID
  * @param {string} status - New status
  * @param {object} [tx=writeDb] - Optional transaction object to use instead of writeDb
+ * @param {object} [additionalData={}] - Additional fields to update
  * @returns {Promise<object|null>} Updated queue entry
  */
-export async function updateQueueStatus(restaurantId, queueId, status, tx = writeDb) {
-  const updateData = { status };
+export async function updateQueueStatus(restaurantId, queueId, status, tx = writeDb, additionalData = {}) {
+  const updateData = { status, ...additionalData };
 
   // Set timestamp based on status
   if (status === "CALLED") {
@@ -325,7 +341,8 @@ export async function callNextGuest(restaurantId) {
  * @returns {Promise<object|null>} Updated entry
  */
 export async function seatGuest(restaurantId, queueId, tableId = null) {
-  const entry = await updateQueueStatus(restaurantId, queueId, "SEATED");
+  const additionalData = tableId ? { assignedTableId: tableId } : {};
+  const entry = await updateQueueStatus(restaurantId, queueId, "SEATED", writeDb, additionalData);
   
   // Optionally update table status to OCCUPIED
   let updatedTable = null;

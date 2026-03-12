@@ -127,6 +127,10 @@ export const restaurants = pgTable("restaurants", {
   isActive: boolean("is_active").notNull().default(true),
   /** Monotonically increasing per-restaurant invoice counter. Used for unique INV-XXXXXX bill numbers. */
   invoiceCounter: integer("invoice_counter").notNull().default(0),
+  /** Monotonically increasing per-restaurant order counter. Used for unique human-readable order numbers. */
+  orderCounter: integer("order_counter").notNull().default(0),
+  /** Monotonically increasing per-restaurant KOT counter. Used for KOT ticket numbers. */
+  kotCounter: integer("kot_counter").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
@@ -251,6 +255,28 @@ export const menuItems = pgTable("menu_items", {
 });
 
 //
+// Menu Suggestions
+//
+export const menuSuggestions = pgTable("menu_suggestions", {
+  id: varchar("id")
+    .primaryKey()
+    .default(sql`gen_random_uuid()`),
+  name: varchar("name", { length: 200 }).notNull(),
+  description: text("description"),
+  price: numeric("price", { precision: 10, scale: 2 }).notNull(),
+  imageUrl: text("image_url"),
+  category: varchar("category", { length: 150 }),
+  dietaryTags: varchar("dietary_tags", { length: 50 }).array(), // Veg, Non-Veg
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+}, (table) => {
+  return {
+    nameSearchIdx: index("menu_suggestions_name_search_idx").using("gin", sql`to_tsvector('english', ${table.name})`),
+    categoryIdx: index("menu_suggestions_category_idx").on(table.category),
+  };
+});
+
+//
 // Staff & roles - MOVED BEFORE tables (since tables references staff)
 //
 export const staff = pgTable("staff", {
@@ -363,10 +389,12 @@ export const orders = pgTable("orders", {
   paid_amount: numeric("paid_amount", { precision: 10, scale: 2 }).notNull().default("0"),
   notes: text("notes"),
   isClosed: boolean("is_closed").notNull().default(false),
+  orderNumber: integer("order_number"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
   closedAt: timestamp("closed_at", { withTimezone: true }),
 }, (table) => ({
+  restaurantOrderNumberIdx: index("orders_restaurant_order_number_idx").on(table.restaurantId, table.orderNumber),
   restaurantStatusDateIdx: index("orders_restaurant_status_date_idx").on(table.restaurantId, table.status, table.createdAt),
   restaurantTableIdx: index("orders_restaurant_table_idx").on(table.restaurantId, table.tableId),
   // H7: updatedAt index for queries filtering "what changed since X"
@@ -398,10 +426,12 @@ export const orderItems = pgTable("order_items", {
   variantPrice: numeric("variant_price", { precision: 10, scale: 2 }),
   selectedModifiers: jsonb("selected_modifiers").default(sql`'[]'::jsonb`),
   customizationAmount: numeric("customization_amount", { precision: 10, scale: 2 }).default("0"),
+  kotNumber: integer("kot_number"),
 }, (table) => {
   return {
     orderRestaurantIdx: index("order_items_order_restaurant_idx").on(table.orderId, table.restaurantId),
     restaurantCreatedAtIdx: index("order_items_restaurant_created_idx").on(table.restaurantId, table.createdAt).where(sql`status != 'CANCELLED'`),
+    restaurantKotNumberIdx: index("order_items_restaurant_kot_idx").on(table.restaurantId, table.kotNumber),
   };
 });
 
@@ -496,6 +526,11 @@ export const guestQueue = pgTable("guest_queue", {
   seatedTime: timestamp("seated_time", { withTimezone: true }),
   cancelledTime: timestamp("cancelled_time", { withTimezone: true }),
   notes: text("notes"),
+
+  assignedTableId: varchar("assigned_table_id").references(
+    () => tables.id,
+    { onDelete: "set null" }
+  ),
 }, (table) => {
   return {
     restaurantStatusTimeIdx: index("guest_queue_restaurant_status_time_idx").on(table.restaurantId, table.status, table.entryTime),
@@ -716,6 +751,7 @@ export type Subscription = typeof subscriptions.$inferSelect;
 export type MenuCategory = typeof menuCategories.$inferSelect;
 export type MenuExtractionJob = typeof menuExtractionJobs.$inferSelect;
 export type MenuItem = typeof menuItems.$inferSelect;
+export type MenuSuggestion = typeof menuSuggestions.$inferSelect;
 export type Table = typeof tables.$inferSelect;
 export type Order = typeof orders.$inferSelect;
 export type OrderItem = typeof orderItems.$inferSelect;

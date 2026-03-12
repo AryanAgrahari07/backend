@@ -11,7 +11,19 @@ export async function findUserByEmail(email) {
      LIMIT 1`,
     [email],
   );
-  return result.rows[0] || null;
+  if (result.rows[0]) return { ...result.rows[0], isStaff: false };
+
+  // Also query staff ADMIN
+  const staff = await pool.query(
+    `SELECT id, email, passcode_hash AS "passwordHash", full_name AS "fullName", 'owner' AS role, restaurant_id AS "restaurantId"
+     FROM staff
+     WHERE role = 'ADMIN' AND lower(email) = lower($1) AND is_active = true
+     LIMIT 1`,
+    [email],
+  );
+  if (staff.rows[0]) return { ...staff.rows[0], isStaff: true, staffId: staff.rows[0].id };
+
+  return null;
 }
 
 export async function findUserById(id) {
@@ -23,7 +35,19 @@ export async function findUserById(id) {
      LIMIT 1`,
     [id],
   );
-  return result.rows[0] || null;
+  if (result.rows[0]) return { ...result.rows[0], isStaff: false };
+
+  // Also query staff ADMIN
+  const staff = await pool.query(
+    `SELECT id, email, passcode_hash AS "passwordHash", full_name AS "fullName", 'owner' AS role, restaurant_id AS "restaurantId"
+     FROM staff
+     WHERE id = $1 AND role = 'ADMIN' AND is_active = true
+     LIMIT 1`,
+    [id],
+  );
+  if (staff.rows[0]) return { ...staff.rows[0], isStaff: true, staffId: staff.rows[0].id };
+
+  return null;
 }
 
 export async function createUser({ email, password, fullName, role = "owner" }) {

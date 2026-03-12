@@ -270,7 +270,6 @@ export async function cancelOrderWithReason(restaurantId, orderId, cancelReason)
     .update(orders)
     .set({
       status: "CANCELLED",
-      paymentStatus: "DUE", // Reset payment status on cancel
       cancelReason: cancelReason.trim(),
       updatedAt: new Date(),
       closedAt: new Date(),
@@ -468,6 +467,12 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
   const order = orderRows[0];
   console.log("📝 New OPEN order created:", order.id, "Payment status:", order.paymentStatus);
 
+  // Increment KOT counter
+  const kotCounterResult = await tx.execute(
+    sql`UPDATE restaurants SET kot_counter = kot_counter + 1 WHERE id = ${restaurantId} RETURNING kot_counter`
+  );
+  const currentKotNumber = kotCounterResult.rows[0]?.kot_counter || null;
+
   const orderItemsData = processedItems.map((item) => ({
     restaurantId,
     orderId: order.id,
@@ -485,6 +490,7 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
     variantPrice: item.variantPrice || null,
     selectedModifiers: sql`${JSON.stringify(item.selectedModifiers || [])}::jsonb`,
     customizationAmount: item.customizationAmount || "0",
+    kotNumber: currentKotNumber,
   }));
 
   const createdItems = await tx
@@ -537,7 +543,7 @@ export async function createOrder(restaurantId, data, placedByStaffId = null) {
         combinedGst: parseFloat(order.gstAmount),
         combinedService: parseFloat(order.serviceTaxAmount),
         combinedTotal: parseFloat(order.totalAmount),
-      });
+      }, tx); // Pass tx to avoid "Order not found" error on uncommitted order
     } catch (err) {
       console.error("Failed to create transaction for prepaid order:", err);
     }
@@ -585,6 +591,7 @@ export async function getOrder(restaurantId, orderId) {
             'variantPrice', i.variant_price,
             'selectedModifiers', i.selected_modifiers,
             'customizationAmount', i.customization_amount,
+            'kotNumber', i.kot_number,
             'createdAt', i.created_at,
             'updatedAt', i.updated_at
           )
@@ -1385,7 +1392,7 @@ export async function getOrderStats(restaurantId, options = {}) {
  * @param {string} paymentStatus - Payment status for new items (PAID, DUE)
  * @returns {Promise<object>} Updated order with new items
  */
-export async function addOrderItems(restaurantId, orderId, items, paymentMethod = "DUE", paymentStatus = "DUE") {
+export async function addOrderItems(restaurantId, orderId, items, paymentMethod = "DUE", paymentStatus = "DUE", dbToUse = db) {
   // Verify order exists and belongs to restaurant
   const order = await getOrder(restaurantId, orderId);
   if (!order) {
@@ -1408,8 +1415,15 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
   // Process new items with customization
   const { processedItems, subtotal: additionalTotal } = await processOrderItemsWithCustomization(
     restaurantId,
-    items
+    items,
+    dbToUse
   );
+
+  // Increment KOT counter for this new batch of items
+  const kotCounterResult = await dbToUse.execute(
+    sql`UPDATE restaurants SET kot_counter = kot_counter + 1 WHERE id = ${restaurantId} RETURNING kot_counter`
+  );
+  const currentKotNumber = kotCounterResult.rows[0]?.kot_counter || null;
 
   const orderItemsData = processedItems.map((item) => ({
     restaurantId,
@@ -1428,16 +1442,17 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
     variantPrice: item.variantPrice,
     selectedModifiers: sql`${JSON.stringify(item.selectedModifiers)}::jsonb`,
     customizationAmount: item.customizationAmount,
+    kotNumber: currentKotNumber,
   }));
 
-  const newItems = await db
+  const newItems = await dbToUse
     .insert(orderItems)
     .values(orderItemsData)
     .returning();
 
   // Recalculate order totals
   const newSubtotal = parseFloat(order.subtotalAmount) + additionalTotal;
-  const restaurant = await db
+  const restaurant = await dbToUse
     .select()
     .from(restaurants)
     .where(eq(restaurants.id, restaurantId))
@@ -1503,7 +1518,7 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
   }
 
   // Update order totals and payment status
-  await db
+  await dbToUse
     .update(orders)
     .set({
       subtotalAmount: newSubtotal.toFixed(2),
@@ -1521,7 +1536,7 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
   // ✅ If new items were PAID, create/update transaction
   if (paymentStatus === "PAID" && paymentMethod !== "DUE" && additionalTotalWithTax > 0) {
     // Check if transaction exists
-    const existingTransactionRows = await db
+    const existingTransactionRows = await dbToUse
       .select()
       .from(transactions)
       .where(eq(transactions.orderId, orderId))
@@ -1531,7 +1546,7 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
 
     if (existingTransaction) {
       // Update existing transaction
-      await db
+      await dbToUse
         .update(transactions)
         .set({
           paymentMethod: paymentMethod.toUpperCase(),
@@ -1555,7 +1570,7 @@ export async function addOrderItems(restaurantId, orderId, items, paymentMethod 
           combinedGst: newGst,
           combinedService: newService,
           combinedTotal: newTotal,
-        });
+        }, dbToUse);
       } catch (err) {
         console.error("Failed to create transaction:", err);
       }

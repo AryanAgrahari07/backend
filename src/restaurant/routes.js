@@ -14,6 +14,7 @@ import {
 } from "./service.js";
 import { getRedisClient } from "../redis/client.js";
 import { cacheGetOrSetJson } from "../redis/cache.js";
+import { invalidateMenuCache } from "../menu/routes.js";
 
 const router = express.Router();
 
@@ -186,11 +187,19 @@ export function registerRestaurantRoutes(app) {
       const existing = await getRestaurant(req.params.id);
       if (!existing) return res.status(404).json({ message: "Not found" });
       
-      if (req.user.role !== "platform_admin" && existing.ownerId !== req.user.id) {
+      const hasAccess = 
+        req.user.role === "platform_admin" ||
+        existing.ownerId === req.user.id ||
+        req.user.restaurantId === req.params.id;
+
+      if (!hasAccess) {
         return res.status(403).json({ message: "Access denied" });
       }
       
       const restaurant = await updateRestaurant(req.params.id, parsed.data);
+      if (restaurant) {
+        await invalidateMenuCache(restaurant.id);
+      }
       res.json({ restaurant });
     }),
   );

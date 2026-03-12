@@ -22,6 +22,16 @@ export async function getVariantsForMenuItem(menuItemId) {
 export async function createVariant(restaurantId, menuItemId, data) {
   const { variantName, price, isDefault = false, sortOrder } = data;
   
+  // If this variant is default, clear all other defaults for this menu item first
+  if (isDefault) {
+    await pool.query(
+      `UPDATE menu_item_variants
+       SET is_default = false
+       WHERE menu_item_id = $1`,
+      [menuItemId]
+    );
+  }
+
   const result = await pool.query(
     `INSERT INTO menu_item_variants 
       (restaurant_id, menu_item_id, variant_name, price, is_default, sort_order)
@@ -40,6 +50,24 @@ export async function updateVariant(restaurantId, variantId, data) {
   const fields = [];
   const values = [];
   let idx = 1;
+
+  // If setting as default, clear all other defaults for this menu item first
+  if (data.isDefault === true) {
+    // Find which menu item this variant belongs to
+    const ownerResult = await pool.query(
+      `SELECT menu_item_id FROM menu_item_variants WHERE id = $1`,
+      [variantId]
+    );
+    if (ownerResult.rows.length > 0) {
+      const menuItemId = ownerResult.rows[0].menu_item_id;
+      await pool.query(
+        `UPDATE menu_item_variants
+         SET is_default = false
+         WHERE menu_item_id = $1 AND id != $2`,
+        [menuItemId, variantId]
+      );
+    }
+  }
 
   if (data.variantName !== undefined) {
     fields.push(`variant_name = $${idx++}`);

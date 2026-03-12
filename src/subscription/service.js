@@ -28,6 +28,26 @@ export async function getCurrentSubscription(restaurantId) {
   
   const subData = result.rows[0];
 
+  // Fallback: if subscription_valid_until is null but status is ACTIVE,
+  // look up the active subscription record's end_date (handles old onboarding bug
+  // where the restaurant row wasn't updated with the trial end date)
+  if (subData && !subData.subscriptionValidUntil && subData.subscriptionStatus === 'ACTIVE') {
+    const activeSub = await pool.query(
+      `SELECT end_date FROM subscriptions 
+       WHERE restaurant_id = $1 AND status = 'ACTIVE' 
+       ORDER BY created_at DESC LIMIT 1`,
+      [restaurantId]
+    );
+    if (activeSub.rows.length > 0 && activeSub.rows[0].end_date) {
+      subData.subscriptionValidUntil = activeSub.rows[0].end_date;
+      // Also patch the restaurants table so future calls are fast
+      await pool.query(
+        `UPDATE restaurants SET subscription_valid_until = $1 WHERE id = $2`,
+        [activeSub.rows[0].end_date, restaurantId]
+      );
+    }
+  }
+
   // Check if they have ever used the STARTER plan
   const starterCheck = await pool.query(
     `SELECT id FROM subscriptions WHERE restaurant_id = $1 AND plan = 'STARTER'`,

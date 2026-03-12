@@ -29,6 +29,7 @@ const listTransactionsQuerySchema = z.object({
   fromDate: z.string().optional(),
   toDate: z.string().optional(),
   paymentMethod: z.enum(["CASH", "UPI", "CARD", "WALLET", "OTHER"]).optional(),
+  orderType: z.enum(["DINE_IN", "TAKEAWAY", "DELIVERY"]).optional(),
   search: z.string().optional(),
   limit: z.coerce.number().int().positive().max(100).optional().default(50),
   offset: z.coerce.number().int().min(0).optional().default(0),
@@ -38,6 +39,7 @@ const exportCSVQuerySchema = z.object({
   fromDate: z.string().optional(),
   toDate: z.string().optional(),
   paymentMethod: z.enum(["CASH", "UPI", "CARD", "WALLET", "OTHER"]).optional(),
+  orderType: z.enum(["DINE_IN", "TAKEAWAY", "DELIVERY"]).optional(),
 });
 
 export function registerTransactionRoutes(app) {
