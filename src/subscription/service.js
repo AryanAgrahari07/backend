@@ -3,6 +3,7 @@ import crypto from "crypto";
 import { pool } from "../dbClient.js";
 import { env } from "../config/env.js";
 import { getRedisClient } from "../redis/client.js";
+import { sendSubscriptionInvoice } from "../email/service.js";
 
 // Export the singleton
 export const razorpay = new Razorpay({
@@ -217,6 +218,32 @@ export async function verifyPaymentAndActivate(restaurantId, razorpayOrderId, ra
   const redis = getRedisClient();
   if (redis) await redis.del(`sub:status:${restaurantId}`);
 
+  // Fire-and-forget invoice email
+  try {
+    const ownerResult = await pool.query(
+      `SELECT u.email, r.name AS "restaurantName"
+       FROM restaurants r
+       JOIN users u ON u.id = r.owner_id
+       WHERE r.id = $1`,
+      [restaurantId]
+    );
+    const owner = ownerResult.rows[0];
+    if (owner?.email) {
+      const plan = PLANS[sub.plan];
+      sendSubscriptionInvoice({
+        to: owner.email,
+        restaurantName: owner.restaurantName,
+        plan: sub.plan,
+        amount: plan?.amount ?? 0,
+        validUntil: newValidUntil,
+        paymentId: razorpayPaymentId,
+        isRenewal: !!(currentValid && new Date(currentValid) > new Date() && currentPlan !== 'STARTER'),
+      });
+    }
+  } catch (emailErr) {
+    console.error("[Email] Could not send invoice:", emailErr.message);
+  }
+
   return { success: true, validUntil: newValidUntil };
 }
 
@@ -319,6 +346,32 @@ export async function handleRazorpayWebhook(rawBody, signature, event) {
 
     const redis = getRedisClient();
     if (redis) await redis.del(`sub:status:${restaurantId}`);
+
+    // Fire-and-forget invoice email
+    try {
+      const ownerResult = await pool.query(
+        `SELECT u.email, r.name AS "restaurantName"
+         FROM restaurants r
+         JOIN users u ON u.id = r.owner_id
+         WHERE r.id = $1`,
+        [restaurantId]
+      );
+      const owner = ownerResult.rows[0];
+      if (owner?.email) {
+        const planInfo = PLANS[sub.plan];
+        sendSubscriptionInvoice({
+          to: owner.email,
+          restaurantName: owner.restaurantName,
+          plan: sub.plan,
+          amount: planInfo?.amount ?? 0,
+          validUntil: newValidUntil,
+          paymentId: payment?.id,
+          isRenewal: !!(currentValid && new Date(currentValid) > new Date() && currentPlan !== 'STARTER'),
+        });
+      }
+    } catch (emailErr) {
+      console.error("[Email] Could not send webhook invoice:", emailErr.message);
+    }
 
     return { success: true, orderId: orderId, action: "ACTIVATED" };
   } else if (eventType === "payment.failed") {

@@ -66,5 +66,12 @@ export const env = {
   // Set AWS_CLOUDFRONT_URL to your CloudFront distribution domain, e.g. https://d1234.cloudfront.net
   // If not set, falls back to direct S3 URL. No code changes needed once this is set.
   cdnUrl: process.env.AWS_CLOUDFRONT_URL || process.env.CDN_URL || null,
+
+  // Email / SMTP (all optional — email is skipped gracefully if not configured)
+  smtpHost: process.env.SMTP_HOST,
+  smtpPort: process.env.SMTP_PORT || "587",
+  smtpUser: process.env.SMTP_USER,
+  smtpPass: process.env.SMTP_PASS,
+  smtpFrom: process.env.SMTP_FROM || "Orderzi <noreply@orderzi.com>",
 };
 

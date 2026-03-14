@@ -21,8 +21,50 @@ import {
 } from "./refreshTokens.js";
 import { getRedisClient } from "../redis/client.js";
 import { randomUUID } from "crypto";
+import { sendOtpEmail } from "../email/service.js";
 
 import { wsTicketMemoryFallback } from "./wsTicketStore.js";
+
+// In-memory OTP fallback (used when Redis is unavailable)
+const otpMemoryStore = new Map();
+function otpKey(purpose, email) {
+  return `otp:${purpose}:${email.toLowerCase()}`;
+}
+function resetKey(email) {
+  return `pwreset:${email.toLowerCase()}`;
+}
+async function storeOtp(key, value, ttlSec) {
+  const redis = getRedisClient();
+  if (redis && redis.status === "ready") {
+    await redis.setex(key, ttlSec, value);
+  } else {
+    otpMemoryStore.set(key, { value, expiresAt: Date.now() + ttlSec * 1000 });
+  }
+}
+async function readOtp(key) {
+  const redis = getRedisClient();
+  if (redis && redis.status === "ready") {
+    return await redis.get(key);
+  }
+  const entry = otpMemoryStore.get(key);
+  if (!entry || Date.now() > entry.expiresAt) {
+    otpMemoryStore.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+async function deleteOtp(key) {
+  const redis = getRedisClient();
+  if (redis && redis.status === "ready") {
+    await redis.del(key);
+  } else {
+    otpMemoryStore.delete(key);
+  }
+}
+function generateOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
 
 const router = express.Router();
 
@@ -381,6 +423,128 @@ router.post(
         ...(includeRefreshInBody ? { refreshToken: nextRefreshToken } : {}),
       });
     }),
+  );
+
+  // ──────────────────────────────────────────────
+  // OTP: send OTP (email verify OR password reset)
+  // ──────────────────────────────────────────────
+  router.post(
+    "/send-otp",
+    rateLimit({ keyPrefix: "auth:send-otp", windowSeconds: 60, max: 3 }),
+    asyncHandler(async (req, res) => {
+      const schema = z.object({
+        email: z.string().email(),
+        purpose: z.enum(["EMAIL_VERIFY", "PASSWORD_RESET"]),
+      });
+      const parsed = schema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Invalid input", errors: parsed.error.errors });
+      }
+
+      const { email, purpose } = parsed.data;
+
+      // For PASSWORD_RESET, check that the user actually exists (but don't reveal it)
+      if (purpose === "PASSWORD_RESET") {
+        const user = await findUserByEmail(email);
+        if (!user) {
+          // Return success to prevent email enumeration
+          return res.json({ success: true });
+        }
+      }
+
+      const otp = generateOtp();
+      const key = otpKey(purpose, email);
+      await storeOtp(key, otp, 600); // 10 min TTL
+
+      // Send email (fire-and-forget inside sendOtpEmail, never throws)
+      await sendOtpEmail({ to: email, otp, purpose });
+
+      return res.json({ success: true });
+    })
+  );
+
+  // ──────────────────────────────────────────────
+  // OTP: verify OTP
+  // ──────────────────────────────────────────────
+  router.post(
+    "/verify-otp",
+    rateLimit({ keyPrefix: "auth:verify-otp", windowSeconds: 60, max: 10 }),
+    asyncHandler(async (req, res) => {
+      const schema = z.object({
+        email: z.string().email(),
+        otp: z.string().length(6),
+        purpose: z.enum(["EMAIL_VERIFY", "PASSWORD_RESET"]),
+      });
+      const parsed = schema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Invalid input", errors: parsed.error.errors });
+      }
+
+      const { email, otp, purpose } = parsed.data;
+      const key = otpKey(purpose, email);
+      const stored = await readOtp(key);
+
+      if (!stored || stored !== otp) {
+        return res.status(400).json({ message: "Invalid or expired OTP" });
+      }
+
+      // OTP is valid — delete it (one-time use)
+      await deleteOtp(key);
+
+      if (purpose === "PASSWORD_RESET") {
+        // Issue a short-lived reset token (5 min)
+        const resetToken = randomUUID();
+        await storeOtp(resetKey(email), resetToken, 300);
+        return res.json({ success: true, resetToken });
+      }
+
+      return res.json({ success: true });
+    })
+  );
+
+  // ──────────────────────────────────────────────
+  // OTP: reset password (after OTP verified)
+  // ──────────────────────────────────────────────
+  router.post(
+    "/reset-password",
+    rateLimit({ keyPrefix: "auth:reset-password", windowSeconds: 60, max: 5 }),
+    asyncHandler(async (req, res) => {
+      const schema = z.object({
+        email: z.string().email(),
+        resetToken: z.string().uuid(),
+        newPassword: z.string().min(6),
+      });
+      const parsed = schema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Invalid input", errors: parsed.error.errors });
+      }
+
+      const { email, resetToken, newPassword } = parsed.data;
+      const rKey = resetKey(email);
+      const stored = await readOtp(rKey);
+
+      if (!stored || stored !== resetToken) {
+        return res.status(400).json({ message: "Reset session expired. Please try again." });
+      }
+
+      // Find user
+      const user = await findUserByEmail(email);
+      if (!user) {
+        return res.status(400).json({ message: "Reset session expired. Please try again." });
+      }
+
+      // Hash new password and update
+      const hash = await bcrypt.hash(newPassword, 10);
+      await pool.query(
+        `UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`,
+        [hash, user.id]
+      );
+
+      // Consume reset token
+      await deleteOtp(rKey);
+
+      return res.json({ success: true });
+    })
   );
 
   app.use("/api/auth", router);

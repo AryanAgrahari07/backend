@@ -421,6 +421,7 @@ export async function getMenuForRestaurantWithCustomizations(
               name,
               name_translations AS "nameTranslations",
               description,
+              description_translations AS "descriptionTranslations",
               price,
               image_url AS "imageUrl",
               is_available AS "isAvailable",
